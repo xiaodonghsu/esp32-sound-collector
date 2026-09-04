@@ -1,0 +1,12 @@
+menu "Bestlink recorder"
+
+config XVF_I2S_INPUT_RATE_HZ
+    int "XVF3800 I2S input sample rate (Hz)"
+    range 16000 48000
+    default 48000
+    help
+        Set this to the sample rate produced by the installed XVF3800 I2S-master
+        firmware. Supported values are 16000 and 48000. A 48 kHz input is
+        downsampled to the required 16 kHz WebSocket PCM stream.
+
+endmenu
