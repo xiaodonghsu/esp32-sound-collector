@@ -91,17 +91,52 @@ esp_err_t xvf3800_get_status(xvf3800_status_t *status)
 {
     if (!status) return ESP_ERR_INVALID_ARG;
     memset(status, 0, sizeof(*status));
+
+    esp_err_t first_err = ESP_OK;
+    esp_err_t err;
     uint8_t version[3];
-    ESP_RETURN_ON_ERROR(read_bytes(XVF_RES_APP, XVF_CMD_VERSION, version, sizeof(version)), TAG, "read version");
-    snprintf(status->version, sizeof(status->version), "%u.%u.%u", version[0], version[1], version[2]);
-    ESP_RETURN_ON_ERROR(read_bytes(XVF_RES_GPO, XVF_CMD_LED_EFFECT, &status->led_effect, 1), TAG, "read effect");
-    ESP_RETURN_ON_ERROR(read_bytes(XVF_RES_GPO, XVF_CMD_LED_BRIGHT, &status->led_brightness, 1), TAG, "read brightness");
-    ESP_RETURN_ON_ERROR(read_bytes(XVF_RES_GPO, XVF_CMD_LED_SPEED, &status->led_speed, 1), TAG, "read speed");
+    err = read_bytes(XVF_RES_APP, XVF_CMD_VERSION, version, sizeof(version));
+    if (err == ESP_OK) {
+        snprintf(status->version, sizeof(status->version), "%u.%u.%u", version[0], version[1], version[2]);
+        status->version_valid = true;
+    } else {
+        ESP_LOGW(TAG, "read version failed: %s", esp_err_to_name(err));
+        first_err = err;
+    }
+
+    err = read_bytes(XVF_RES_GPO, XVF_CMD_LED_EFFECT, &status->led_effect, 1);
+    if (err == ESP_OK) status->led_effect_valid = true;
+    else {
+        ESP_LOGW(TAG, "read effect failed: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK) first_err = err;
+    }
+
+    err = read_bytes(XVF_RES_GPO, XVF_CMD_LED_BRIGHT, &status->led_brightness, 1);
+    if (err == ESP_OK) status->led_brightness_valid = true;
+    else {
+        ESP_LOGW(TAG, "read brightness failed: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK) first_err = err;
+    }
+
+    err = read_bytes(XVF_RES_GPO, XVF_CMD_LED_SPEED, &status->led_speed, 1);
+    if (err == ESP_OK) status->led_speed_valid = true;
+    else {
+        ESP_LOGW(TAG, "read speed failed: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK) first_err = err;
+    }
+
     uint8_t color[4];
-    ESP_RETURN_ON_ERROR(read_bytes(XVF_RES_GPO, XVF_CMD_LED_COLOR, color, sizeof(color)), TAG, "read color");
-    status->led_color = (uint32_t)color[0] | ((uint32_t)color[1] << 8) |
-                        ((uint32_t)color[2] << 16) | ((uint32_t)color[3] << 24);
-    return ESP_OK;
+    err = read_bytes(XVF_RES_GPO, XVF_CMD_LED_COLOR, color, sizeof(color));
+    if (err == ESP_OK) {
+        status->led_color = (uint32_t)color[0] | ((uint32_t)color[1] << 8) |
+                            ((uint32_t)color[2] << 16) | ((uint32_t)color[3] << 24);
+        status->led_color_valid = true;
+    } else {
+        ESP_LOGW(TAG, "read color failed: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK) first_err = err;
+    }
+
+    return first_err;
 }
 
 esp_err_t xvf3800_set_parameter(const char *name, uint32_t value)

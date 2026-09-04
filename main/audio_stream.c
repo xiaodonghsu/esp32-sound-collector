@@ -10,6 +10,7 @@
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_websocket_client.h"
 
 #define AUDIO_RATE             16000
@@ -35,6 +36,27 @@ static char s_url[512];
 static audio_stream_started_cb_t s_callback;
 static void *s_callback_ctx;
 static bool s_callback_called;
+static int64_t s_started_at_us;
+static uint32_t s_duration;
+static uint32_t s_segments;
+
+static uint32_t elapsed_seconds(void)
+{
+    int64_t elapsed_us = esp_timer_get_time() - s_started_at_us;
+    if (elapsed_us <= 0) return 0;
+    uint64_t seconds = (uint64_t)elapsed_us / 1000000;
+    return seconds > UINT32_MAX ? UINT32_MAX : (uint32_t)seconds;
+}
+
+static void mark_stream_stopped(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_running) {
+        s_duration = elapsed_seconds();
+        s_running = false;
+    }
+    xSemaphoreGive(s_lock);
+}
 
 static void notify_started(bool success, const char *detail)
 {
@@ -70,13 +92,14 @@ static esp_err_t i2s_start(void)
         ESP_LOGE(TAG, "XVF input rate must be 16000 or 48000 Hz");
         return ESP_ERR_INVALID_ARG;
     }
-    i2s_chan_config_t channel = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_SLAVE);
+    /* Match Seeed's record/playback example: the ESP32 supplies BCLK and WS. */
+    i2s_chan_config_t channel = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     channel.dma_desc_num = 8;
     channel.dma_frame_num = 256;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&channel, NULL, &s_rx), TAG, "I2S channel");
     i2s_std_config_t config = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_INPUT_RATE),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = AUDIO_I2S_BCLK,
@@ -103,7 +126,7 @@ static void capture_task(void *arg)
     int32_t *input = malloc(256 * 2 * sizeof(int32_t));
     if (!segment || !input) {
         notify_started(false, "audio buffer allocation failed");
-        s_running = false;
+        mark_stream_stopped();
         goto done;
     }
     size_t used = 0;
@@ -117,7 +140,7 @@ static void capture_task(void *arg)
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "I2S read failed: %s", esp_err_to_name(err));
             notify_started(false, "I2S read failed");
-            s_running = false;
+            mark_stream_stopped();
             break;
         }
         size_t frames = bytes_read / (2 * sizeof(int32_t));
@@ -160,13 +183,13 @@ static void network_task(void *arg)
     s_ws = esp_websocket_client_init(&config);
     if (!s_ws) {
         notify_started(false, "WebSocket client initialization failed");
-        s_running = false;
+        mark_stream_stopped();
         goto done;
     }
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, websocket_event, NULL);
     if (esp_websocket_client_start(s_ws) != ESP_OK) {
         notify_started(false, "WebSocket client start failed");
-        s_running = false;
+        mark_stream_stopped();
         goto destroy;
     }
 
@@ -175,7 +198,7 @@ static void network_task(void *arg)
         if (!(xEventGroupGetBits(s_events) & AUDIO_WS_CONNECTED)) {
             if (!s_callback_called && (int32_t)(xTaskGetTickCount() - start_deadline) >= 0) {
                 notify_started(false, "WebSocket connection timeout");
-                s_running = false;
+                mark_stream_stopped();
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -183,11 +206,22 @@ static void network_task(void *arg)
         }
         size_t size = 0;
         uint8_t *item = xRingbufferReceive(s_ring, &size, pdMS_TO_TICKS(200));
-        if (!item) continue;
+        if (!item) {
+            if (!s_callback_called && (int32_t)(xTaskGetTickCount() - start_deadline) >= 0) {
+                ESP_LOGE(TAG, "no I2S audio received before start timeout");
+                notify_started(false, "I2S audio timeout");
+                mark_stream_stopped();
+            }
+            continue;
+        }
         int sent = esp_websocket_client_send_bin(s_ws, (const char *)item, size, pdMS_TO_TICKS(5000));
         vRingbufferReturnItem(s_ring, item);
-        if (sent == (int)size) notify_started(true, "first audio segment sent");
-        else ESP_LOGW(TAG, "audio segment send failed (%d/%u)", sent, (unsigned)size);
+        if (sent == (int)size) {
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            if (s_segments < UINT32_MAX) s_segments++;
+            xSemaphoreGive(s_lock);
+            notify_started(true, "first audio segment sent");
+        } else ESP_LOGW(TAG, "audio segment send failed (%d/%u)", sent, (unsigned)size);
     }
     esp_websocket_client_stop(s_ws);
 destroy:
@@ -222,6 +256,9 @@ esp_err_t audio_stream_start(const char *url, uint32_t segment_ms,
     s_callback = callback;
     s_callback_ctx = ctx;
     s_callback_called = false;
+    s_started_at_us = esp_timer_get_time();
+    s_duration = 0;
+    s_segments = 0;
     xEventGroupClearBits(s_events, AUDIO_EXIT_CAPTURE | AUDIO_EXIT_NETWORK | AUDIO_WS_CONNECTED);
     size_t segment_bytes = AUDIO_RATE * AUDIO_BYTES_PER_SAMPLE * segment_ms / 1000;
     s_ring = xRingbufferCreate(segment_bytes * 10 + 256, RINGBUF_TYPE_NOSPLIT);
@@ -254,7 +291,7 @@ esp_err_t audio_stream_start(const char *url, uint32_t segment_ms,
         return ESP_ERR_NO_MEM;
     }
     xSemaphoreGive(s_lock);
-    ESP_LOGI(TAG, "stream starting: %uHz input -> %uHz PCM, %ums segments, %u bytes",
+    ESP_LOGI(TAG, "stream starting: I2S master, %uHz input -> %uHz PCM, %ums segments, %u bytes",
              (unsigned)AUDIO_INPUT_RATE, (unsigned)AUDIO_RATE,
              (unsigned)segment_ms, (unsigned)segment_bytes);
     return ESP_OK;
@@ -267,6 +304,7 @@ esp_err_t audio_stream_stop(void)
         xSemaphoreGive(s_lock);
         return ESP_ERR_INVALID_STATE;
     }
+    if (s_running) s_duration = elapsed_seconds();
     s_running = false;
     bool needs_callback = !s_callback_called;
     xSemaphoreGive(s_lock);
@@ -291,4 +329,19 @@ esp_err_t audio_stream_stop(void)
     return ESP_OK;
 }
 
-bool audio_stream_is_recording(void) { return s_running; }
+bool audio_stream_is_recording(void)
+{
+    audio_stream_status_t status;
+    audio_stream_get_status(&status);
+    return status.recording;
+}
+
+void audio_stream_get_status(audio_stream_status_t *status)
+{
+    if (!status) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    status->recording = s_running;
+    status->duration = s_running ? elapsed_seconds() : s_duration;
+    status->segments = s_segments;
+    xSemaphoreGive(s_lock);
+}

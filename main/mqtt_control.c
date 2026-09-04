@@ -1,5 +1,8 @@
 #include "mqtt_control.h"
 
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "cJSON.h"
@@ -28,6 +31,13 @@ static char s_topic_out[64];
 
 typedef struct { char *payload; } command_item_t;
 typedef struct { char mid[MQTT_MID_MAX]; } start_pending_t;
+
+typedef struct {
+    uint32_t segment_ms;
+    uint32_t sample_rate_khz;
+    uint32_t bit_rate;
+    uint32_t channels;
+} audio_url_params_t;
 
 static void publish_json(cJSON *json)
 {
@@ -63,16 +73,72 @@ static const char *get_string(cJSON *j, const char *name)
     return cJSON_IsString(item) ? item->valuestring : NULL;
 }
 
+static bool parse_uint_param(const char *value, size_t length, uint32_t *result)
+{
+    if (!value || !length || length >= 16) return false;
+    char text[16];
+    memcpy(text, value, length);
+    text[length] = '\0';
+    char *end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(text, &end, 10);
+    if (errno || end == text || *end || parsed > UINT32_MAX) return false;
+    *result = (uint32_t)parsed;
+    return true;
+}
+
+static bool query_name_equals(const char *name, size_t length, const char *expected)
+{
+    return strlen(expected) == length && !strncmp(name, expected, length);
+}
+
+static const char *parse_audio_url_params(const char *url, audio_url_params_t *params)
+{
+    *params = (audio_url_params_t) {
+        .segment_ms = 200,
+        .sample_rate_khz = 16,
+        .bit_rate = 16,
+        .channels = 1,
+    };
+
+    const char *query = strchr(url, '?');
+    if (!query) return NULL;
+    for (query++; *query && *query != '#';) {
+        const char *entry_end = strpbrk(query, "&#");
+        if (!entry_end) entry_end = query + strlen(query);
+        const char *equals = memchr(query, '=', entry_end - query);
+        if (equals) {
+            uint32_t *target = NULL;
+            size_t name_length = equals - query;
+            if (query_name_equals(query, name_length, "segment")) target = &params->segment_ms;
+            else if (query_name_equals(query, name_length, "samplerate")) target = &params->sample_rate_khz;
+            else if (query_name_equals(query, name_length, "bitrate")) target = &params->bit_rate;
+            else if (query_name_equals(query, name_length, "channel")) target = &params->channels;
+            if (target && !parse_uint_param(equals + 1, entry_end - equals - 1, target)) {
+                return "invalid audio parameter in url";
+            }
+        }
+        query = *entry_end == '&' ? entry_end + 1 : entry_end;
+    }
+
+    if (params->segment_ms < 20 || params->segment_ms > 2000) return "segment must be 20-2000 ms";
+    if (params->sample_rate_khz != 16) return "only samplerate=16 is supported";
+    if (params->bit_rate != 16) return "only bitrate=16 is supported";
+    if (params->channels != 1) return "only channel=1 is supported";
+    return NULL;
+}
+
 static void handle_start(cJSON *root, const char *mid)
 {
     const char *url = get_string(root, "url");
-    cJSON *segment_item = cJSON_GetObjectItemCaseSensitive(root, "segment");
-    int segment = cJSON_IsNumber(segment_item) ? segment_item->valueint : 200;
     if (!url) { publish_result(mid, false, "url is required"); return; }
+    audio_url_params_t params;
+    const char *validation_error = parse_audio_url_params(url, &params);
+    if (validation_error) { publish_result(mid, false, validation_error); return; }
     start_pending_t *pending = calloc(1, sizeof(*pending));
     if (!pending) { publish_result(mid, false, "out of memory"); return; }
     strlcpy(pending->mid, mid, sizeof(pending->mid));
-    esp_err_t err = audio_stream_start(url, segment, stream_started, pending);
+    esp_err_t err = audio_stream_start(url, params.segment_ms, stream_started, pending);
     if (err != ESP_OK) {
         free(pending);
         publish_result(mid, false, esp_err_to_name(err));
@@ -82,25 +148,32 @@ static void handle_start(cJSON *root, const char *mid)
 static void handle_status(const char *mid)
 {
     xvf3800_status_t xvf;
-    esp_err_t xvf_err = xvf3800_get_status(&xvf);
+    audio_stream_status_t stream;
+    xvf3800_get_status(&xvf);
+    audio_stream_get_status(&stream);
     char ssid[APP_SSID_MAX_LEN + 1], ip[16];
     wifi_manager_ssid(ssid, sizeof(ssid));
     wifi_manager_ip(ip, sizeof(ip));
     cJSON *j = cJSON_CreateObject();
     cJSON_AddStringToObject(j, "mid", mid);
-    cJSON_AddStringToObject(j, "result", xvf_err == ESP_OK ? "success" : "failed");
+    cJSON_AddStringToObject(j, "result", "success");
     cJSON_AddStringToObject(j, "wifi-ssid", ssid);
     cJSON_AddNumberToObject(j, "wifi-rssi", wifi_manager_rssi());
     cJSON_AddStringToObject(j, "wifi-mac", device_identity_id());
     cJSON_AddStringToObject(j, "wifi-ipaddr", ip);
     cJSON_AddStringToObject(j, "recorder-type", "XVF3800");
-    cJSON_AddStringToObject(j, "recorder-version", xvf_err == ESP_OK ? xvf.version : "unknown");
-    if (xvf_err == ESP_OK) {
-        cJSON_AddNumberToObject(j, "led-effict", xvf.led_effect);
-        cJSON_AddNumberToObject(j, "led-brightness", xvf.led_brightness);
-        cJSON_AddNumberToObject(j, "led-speed", xvf.led_speed);
-        cJSON_AddNumberToObject(j, "led-color", xvf.led_color);
-    } else cJSON_AddStringToObject(j, "message", esp_err_to_name(xvf_err));
+    cJSON_AddStringToObject(j, "recorder-version", xvf.version_valid ? xvf.version : "");
+    cJSON_AddBoolToObject(j, "recording", stream.recording);
+    cJSON_AddNumberToObject(j, "duration", stream.duration);
+    cJSON_AddNumberToObject(j, "segments", stream.segments);
+    if (xvf.led_effect_valid) cJSON_AddNumberToObject(j, "led-effict", xvf.led_effect);
+    else cJSON_AddStringToObject(j, "led-effict", "");
+    if (xvf.led_brightness_valid) cJSON_AddNumberToObject(j, "led-brightness", xvf.led_brightness);
+    else cJSON_AddStringToObject(j, "led-brightness", "");
+    if (xvf.led_speed_valid) cJSON_AddNumberToObject(j, "led-speed", xvf.led_speed);
+    else cJSON_AddStringToObject(j, "led-speed", "");
+    if (xvf.led_color_valid) cJSON_AddNumberToObject(j, "led-color", xvf.led_color);
+    else cJSON_AddStringToObject(j, "led-color", "");
     publish_json(j);
 }
 
