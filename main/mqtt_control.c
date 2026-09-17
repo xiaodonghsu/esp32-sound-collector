@@ -18,6 +18,7 @@
 #include "app_config.h"
 #include "audio_stream.h"
 #include "device_identity.h"
+#include "firmware_update.h"
 #include "wifi_manager.h"
 #include "xvf3800.h"
 
@@ -234,6 +235,11 @@ static void handle_command(char *payload)
         cJSON_Delete(root);
         return;
     }
+    if (!firmware_update_control_lock()) {
+        publish_result(mid, false, "firmware upgrade in progress");
+        cJSON_Delete(root);
+        return;
+    }
     if (!strcmp(cmd, "start")) handle_start(root, mid);
     else if (!strcmp(cmd, "stop")) {
         esp_err_t err = audio_stream_stop();
@@ -241,6 +247,7 @@ static void handle_command(char *payload)
     } else if (!strcmp(cmd, "status")) handle_status(mid);
     else if (!strcmp(cmd, "set")) handle_set(root, mid);
     else publish_result(mid, false, "unknown cmd");
+    firmware_update_control_unlock();
     cJSON_Delete(root);
 }
 

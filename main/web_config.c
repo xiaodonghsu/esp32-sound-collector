@@ -17,6 +17,7 @@
 #include "esp_wifi.h"
 #include "app_config.h"
 #include "device_identity.h"
+#include "firmware_update.h"
 #include "mqtt_control.h"
 #include "wifi_manager.h"
 
@@ -34,7 +35,7 @@ static const char PAGE[] =
 "label{display:block;margin:14px 0 5px}input,select,button{box-sizing:border-box;width:100%;padding:11px;border:1px solid #bac3cc;border-radius:7px}"
 "button{cursor:pointer;background:#1267d6;color:white;border:0;font-weight:600}.tabs button.off{background:#dfe5eb;color:#344}.page{display:none}.page.on{display:block}"
 "#msg{min-height:24px;margin-top:14px}.ok{color:#08783e}.bad{color:#b42318}</style></head><body><main>"
-"<h1>Bestlink 4-Mic Recorder</h1><div id=identity></div><div class=tabs><button onclick='show(0)'>设备概览</button><button class=off onclick='show(1)'>Wi-Fi</button><button class=off onclick='show(2)'>MQTT 通信参数</button><button class=off onclick='show(3)'>登录密码</button></div>"
+"<h1>Bestlink 4-Mic Recorder</h1><div id=identity></div><div class=tabs><button onclick='show(0)'>设备概览</button><button class=off onclick='show(1)'>Wi-Fi</button><button class=off onclick='show(2)'>MQTT 通信参数</button><button class=off onclick='show(3)'>登录密码</button><button class=off onclick='show(4)'>固件升级</button></div>"
 "<section class='card page on'><h2>设备概览</h2><button id=refresh onclick=refreshOverview()>刷新概览</button><p id=overviewStatus role=status>正在读取…</p><h3>设备与固件</h3><dl id=device></dl><h3>存储与内存</h3><dl id=memory></dl><p>内存统计为可分配的堆内存；历史最低可用量从本次启动起统计。</p><h3>STA · 上行 Wi-Fi</h3><dl id=sta></dl><h3>Soft AP · 配置热点</h3><dl id=ap></dl></section>"
 "<section class='card page'><h2>Wi-Fi 设置</h2><button onclick=scan()>扫描附近网络</button><label>SSID</label><select id=ssid></select><label>Wi-Fi 密码</label><input id=wpass type=password autocomplete=new-password><button onclick=saveWifi()>验证并保存</button></section>"
 "<section class='card page'><h2>MQTT 通信参数</h2><p>保存后自动使用新参数连接，无需重启设备。</p>"
@@ -44,14 +45,17 @@ static const char PAGE[] =
 "<label for=mpass>密码</label><input id=mpass type=password maxlength=64 autocomplete=new-password placeholder='留空保留当前密码'>"
 "<p>初始默认：" APP_MQTT_DEFAULT_HOST ":" STRINGIFY_VALUE(APP_MQTT_DEFAULT_PORT) "；用户名 " APP_MQTT_DEFAULT_USERNAME "；密码 " APP_MQTT_DEFAULT_PASSWORD "。已保存的密码不回显。</p>"
 "<button id=mqttsave type=submit>保存并应用</button></form></section>"
-"<section class='card page'><h2>修改登录密码</h2><label>新密码（至少 6 个字符）</label><input id=newpass type=password autocomplete=new-password><button onclick=savePassword()>修改密码</button></section><div id=msg></div>"
-"<script>const $=id=>document.getElementById(id);function show(n){document.querySelectorAll('.page').forEach((e,i)=>e.classList.toggle('on',i===n));document.querySelectorAll('.tabs button').forEach((e,i)=>e.classList.toggle('off',i!==n));if(n===0)refreshOverview();if(n===1&&!$('ssid').options.length)scan()}"
+"<section class='card page'><h2>修改登录密码</h2><label>新密码（至少 6 个字符）</label><input id=newpass type=password autocomplete=new-password><button onclick=savePassword()>修改密码</button></section>"
+"<section class='card page'><h2>固件升级</h2><p>选择本项目的 esp32_4mic_array_collector.bin 应用固件（不能使用 bootloader、分区表或合并烧录包）。升级会停止录音，保留网络和登录配置，校验成功后自动重启。</p>"
+"<p id=otaInfo role=status>正在读取分区信息…</p><label for=firmware>应用固件（.bin）</label><input id=firmware type=file accept='.bin,application/octet-stream'>"
+"<p>升级期间请保持供电和连接。失败后需重新上传，录音需重新发送 start 指令。</p><button id=upgrade disabled onclick=uploadFirmware()>上传并升级</button><progress id=otaProgress max=100 value=0 style='width:100%;margin-top:16px'></progress><p id=otaStatus role=status></p></section><div id=msg></div>"
+"<script>const $=id=>document.getElementById(id);function show(n){document.querySelectorAll('.page').forEach((e,i)=>e.classList.toggle('on',i===n));document.querySelectorAll('.tabs button').forEach((e,i)=>e.classList.toggle('off',i!==n));if(n===0)refreshOverview();if(n===1&&!$('ssid').options.length)scan();if(n===4&&!otaBusy)loadOta()}"
 "function note(s,ok=true){$('msg').textContent=s;$('msg').className=ok?'ok':'bad'}async function api(u,o){let r=await fetch(u,o);let j=await r.json().catch(()=>({error:r.statusText}));if(!r.ok)throw Error(j.error||'请求失败');return j}"
 "function rows(id,items){$(id).replaceChildren();items.forEach(([k,v])=>{let dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v==null?'不可用':v;$(id).append(dt,dd)})}"
 "function bytes(n){return n==null?'不可用':(n/1024/(n>=1048576?1024:1)).toFixed(2)+(n>=1048576?' MiB':' KiB')+' ('+n+' B)'}"
 "function heapRows(name,h){return [['总堆内存',h.total],['当前可用',h.free],['历史最低可用',h.minimum_free],['最大连续块',h.largest_block]].map(([k,v])=>[name+' '+k,bytes(v)])}"
 "async function refreshOverview(){if($('refresh').disabled)return;$('refresh').disabled=true;try{let j=await api('/api/overview'),d=j.device,m=j.memory,s=j.sta,a=j.ap;"
-"rows('device',[['设备 ID',d.id],['ESP-IDF',d.idf],['固件版本',d.firmware],['芯片',d.chip],['芯片修订',d.revision],['CPU 核心数',d.cores],['运行时间',d.uptime_seconds+' 秒']]);"
+"rows('device',[['设备 ID',d.id],['ESP-IDF',d.idf],['固件版本',d.firmware],['固件编译时间',d.build_time],['固件 ELF SHA-256',d.elf_sha256],['芯片',d.chip],['芯片修订',d.revision],['CPU 核心数',d.cores],['运行时间',d.uptime_seconds+' 秒']]);"
 "rows('memory',[['Flash 实测容量',bytes(m.flash_bytes)],['Flash 构建配置',m.flash_config],['PSRAM 状态',m.psram_status],['PSRAM 检测容量',bytes(m.psram_bytes)],...heapRows('内部 RAM',m.internal),...heapRows('PSRAM',m.psram)]);"
 "rows('sta',[['状态',s.status],['SSID',s.ssid],['MAC',s.mac],['接入点 BSSID',s.bssid],['信号强度',s.rssi==null?null:s.rssi+' dBm'],['信道',s.channel],['IPv4',s.ip],['子网掩码',s.netmask],['网关',s.gateway]]);"
 "rows('ap',[['状态',a.enabled?'已启用':'未启用'],['SSID',a.ssid],['MAC',a.mac],['IPv4',a.ip],['子网掩码',a.netmask],['信道',a.channel],['安全模式',a.security],['已连接客户端',a.clients],['客户端上限',a.max_clients]]);$('overviewStatus').textContent='更新于 '+new Date().toLocaleTimeString()}catch(e){$('overviewStatus').textContent='刷新失败，显示内容可能已过期：'+e.message}finally{$('refresh').disabled=false}}"
@@ -60,7 +64,13 @@ static const char PAGE[] =
 "async function post(u,b){return api(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}"
 "async function saveWifi(){try{note('正在验证连接，最长约 20 秒…');await post('/api/wifi',{ssid:$('ssid').value,password:$('wpass').value});note('Wi-Fi 已验证并保存')}catch(e){note(e.message,false)}}"
 "async function saveMqtt(){let b=$('mqttsave');b.disabled=true;try{note('正在保存 MQTT 通信参数…');await post('/api/mqtt',{host:$('host').value.trim(),port:Number($('port').value),username:$('user').value,password:$('mpass').value||null});$('mpass').value='';note('MQTT 参数已保存；Wi-Fi 联网后自动连接服务器')}catch(e){note(e.message,false)}finally{b.disabled=false}}"
-"async function savePassword(){try{await post('/api/password',{password:$('newpass').value});note('密码已修改，下次请求需使用新密码')}catch(e){note(e.message,false)}}init()</script></main></body></html>";
+"async function savePassword(){try{await post('/api/password',{password:$('newpass').value});note('密码已修改，下次请求需使用新密码')}catch(e){note(e.message,false)}}"
+"let otaLimit=0,otaBusy=false;async function loadOta(){try{let j=await api('/api/ota');otaLimit=j.available?j.max_bytes:0;$('otaInfo').textContent=j.available?'当前分区：'+j.running+'；固件上限：'+bytes(j.max_bytes):'尚未配置 OTA 分区，请先通过 USB 烧录';$('upgrade').disabled=!otaLimit}catch(e){otaLimit=0;$('upgrade').disabled=true;$('otaInfo').textContent=e.message}}"
+"function uploadFirmware(){if(otaBusy)return;let file=$('firmware').files[0];if(!file||!file.size||!file.name.toLowerCase().endsWith('.bin')||file.size>otaLimit){$('otaStatus').textContent='请选择有效的 .bin 文件，且大小不超过 '+bytes(otaLimit);return}"
+"otaBusy=true;$('upgrade').disabled=true;$('firmware').disabled=true;$('otaProgress').value=0;$('otaStatus').textContent='正在上传，请保持供电和连接…';let x=new XMLHttpRequest();x.open('POST','/api/ota');x.timeout=150000;x.setRequestHeader('Content-Type','application/octet-stream');x.setRequestHeader('X-OTA-Upload','1');"
+"let failed=s=>{otaBusy=false;$('upgrade').disabled=false;$('firmware').disabled=false;$('otaStatus').textContent=s};x.upload.onprogress=e=>{if(e.lengthComputable){let p=Math.round(e.loaded*100/e.total);$('otaProgress').value=p;$('otaStatus').textContent=p===100?'上传完成，设备正在写入和校验…':'上传 '+p+'%'}};"
+"x.onload=()=>{let j;try{j=JSON.parse(x.responseText)}catch(e){failed('服务器响应无效，请刷新确认设备状态');return}if(x.status!==200||!j.ok){failed(j.error||'升级失败，请重新上传');return}$('otaStatus').textContent='校验成功，设备正在重启。请等待约 15 秒，重新连接 Wi-Fi 后刷新页面，在设备概览检查固件版本。'};"
+"x.onerror=()=>failed('连接中断，请刷新确认固件版本；未升级时重新上传');x.ontimeout=()=>failed('升级超时，请刷新确认设备状态后重试');x.send(file)}init()</script></main></body></html>";
 
 static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -217,6 +227,11 @@ static esp_err_t overview_get(httpd_req_t *req)
     cJSON_AddStringToObject(device, "id", device_identity_id());
     cJSON_AddStringToObject(device, "idf", esp_get_idf_version());
     cJSON_AddStringToObject(device, "firmware", esp_app_get_description()->version);
+    char build_time[40], elf_sha256[65];
+    snprintf(build_time, sizeof(build_time), "%s %s", esp_app_get_description()->date, esp_app_get_description()->time);
+    esp_app_get_elf_sha256(elf_sha256, sizeof(elf_sha256));
+    cJSON_AddStringToObject(device, "build_time", build_time);
+    cJSON_AddStringToObject(device, "elf_sha256", elf_sha256);
     cJSON_AddStringToObject(device, "chip", CONFIG_IDF_TARGET);
     char revision[16];
     snprintf(revision, sizeof(revision), "v%u.%u", chip.revision / 100, chip.revision % 100);
@@ -364,10 +379,22 @@ static esp_err_t password_post(httpd_req_t *req)
     return send_json(req, ok, NULL);
 }
 
+static esp_err_t ota_get(httpd_req_t *req)
+{
+    if (require_auth(req) != ESP_OK) return ESP_OK;
+    return firmware_update_info(req);
+}
+
+static esp_err_t ota_post(httpd_req_t *req)
+{
+    if (require_auth(req) != ESP_OK) return ESP_FAIL;
+    return firmware_update_upload(req);
+}
+
 esp_err_t web_config_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 10;
     config.stack_size = 6144;
     ESP_RETURN_ON_ERROR(httpd_start(&s_server, &config), TAG, "http server");
     const httpd_uri_t handlers[] = {
@@ -378,6 +405,8 @@ esp_err_t web_config_start(void)
         {.uri = "/api/wifi", .method = HTTP_POST, .handler = wifi_post},
         {.uri = "/api/mqtt", .method = HTTP_POST, .handler = mqtt_post},
         {.uri = "/api/password", .method = HTTP_POST, .handler = password_post},
+        {.uri = "/api/ota", .method = HTTP_GET, .handler = ota_get},
+        {.uri = "/api/ota", .method = HTTP_POST, .handler = ota_post},
     };
     for (size_t i = 0; i < sizeof(handlers) / sizeof(handlers[0]); ++i) {
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_server, &handlers[i]), TAG, "register uri");
