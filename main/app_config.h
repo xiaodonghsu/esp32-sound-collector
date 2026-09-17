@@ -11,6 +11,11 @@
 #define APP_MQTT_PASS_MAX_LEN   64
 #define APP_WEB_PASS_MAX_LEN    64
 
+#define APP_MQTT_DEFAULT_HOST     "192.168.4.244"
+#define APP_MQTT_DEFAULT_PORT     11883
+#define APP_MQTT_DEFAULT_USERNAME "Recorders"
+#define APP_MQTT_DEFAULT_PASSWORD "bestlink"
+
 typedef struct {
     char wifi_ssid[APP_SSID_MAX_LEN + 1];
     char wifi_password[APP_WIFI_PASS_MAX_LEN + 1];

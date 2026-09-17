@@ -8,10 +8,12 @@
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "mqtt_client.h"
 #include "app_config.h"
 #include "audio_stream.h"
@@ -21,9 +23,13 @@
 
 #define MQTT_COMMAND_MAX 2048
 #define MQTT_MID_MAX     128
+#define MQTT_CONNECTED_BIT BIT0
+#define MQTT_RETRY_BIT BIT1
 
 static const char *TAG = "mqtt_control";
 static esp_mqtt_client_handle_t s_client;
+static bool s_client_started;
+static EventGroupHandle_t s_connection_events;
 static SemaphoreHandle_t s_lock;
 static QueueHandle_t s_commands;
 static char s_topic_in[64];
@@ -46,7 +52,11 @@ static void publish_json(cJSON *json)
     if (!text) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_mqtt_client_handle_t client = s_client;
-    if (client) esp_mqtt_client_publish(client, s_topic_out, text, 0, 1, 0);
+    /* Queue without blocking the audio task on network I/O. The bounded SDK
+     * outbox is retained while reconnection is paused for unavailable Wi-Fi. */
+    if (client && esp_mqtt_client_enqueue(client, s_topic_out, text, 0, 1, 0, true) < 0) {
+        ESP_LOGW(TAG, "response could not be queued (outbox full or allocation failed)");
+    }
     xSemaphoreGive(s_lock);
     free(text);
 }
@@ -251,10 +261,18 @@ static void mqtt_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     (void)arg; (void)base;
     esp_mqtt_event_handle_t event = data;
     if (id == MQTT_EVENT_CONNECTED) {
+        xEventGroupClearBits(s_connection_events, MQTT_RETRY_BIT);
+        xEventGroupSetBits(s_connection_events, MQTT_CONNECTED_BIT);
         esp_mqtt_client_subscribe(event->client, s_topic_in, 1);
         ESP_LOGI(TAG, "connected; subscribed to %s", s_topic_in);
     } else if (id == MQTT_EVENT_DISCONNECTED) {
-        ESP_LOGW(TAG, "disconnected; automatic reconnect enabled");
+        xEventGroupClearBits(s_connection_events, MQTT_CONNECTED_BIT);
+        xEventGroupSetBits(s_connection_events, MQTT_RETRY_BIT);
+        ESP_LOGW(TAG, "disconnected; reconnect when Wi-Fi is ready");
+    } else if (id == MQTT_EVENT_ERROR && event->error_handle) {
+        ESP_LOGW(TAG, "MQTT error type=%d, connect return=%d, socket errno=%d",
+                 event->error_handle->error_type, event->error_handle->connect_return_code,
+                 event->error_handle->esp_transport_sock_errno);
     } else if (id == MQTT_EVENT_DATA) {
         if (event->current_data_offset != 0 || event->data_len != event->total_data_len ||
             event->data_len <= 0 || event->data_len > MQTT_COMMAND_MAX) {
@@ -285,25 +303,73 @@ static esp_err_t create_client_locked(void)
         .credentials.authentication.password = cfg.mqtt_password,
         .session.keepalive = 30,
         .network.reconnect_timeout_ms = 3000,
+        .network.disable_auto_reconnect = true,
+        .outbox.limit = 32768,
     };
     s_client = esp_mqtt_client_init(&mqtt_cfg);
     ESP_RETURN_ON_FALSE(s_client, ESP_ERR_NO_MEM, TAG, "mqtt init");
-    ESP_RETURN_ON_ERROR(esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event, NULL), TAG, "mqtt events");
+    esp_err_t err = esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event, NULL);
+    if (err != ESP_OK) {
+        esp_mqtt_client_destroy(s_client);
+        s_client = NULL;
+        return err;
+    }
     ESP_LOGI(TAG, "MQTT %s, client=%s", uri, device_identity_id());
-    return esp_mqtt_client_start(s_client);
+    return ESP_OK;
+}
+
+/* Reconnect only with an IP. Do not stop the SDK task on Wi-Fi loss: stopping
+ * it clears the outbox. Keep lifecycle calls out of Wi-Fi and MQTT callbacks. */
+static void connection_task(void *arg)
+{
+    (void)arg;
+    int64_t retry_at_us = 0;
+    bool was_online = false;
+    while (true) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        bool online = wifi_manager_is_connected();
+        int64_t now = esp_timer_get_time();
+        if (online && !was_online) retry_at_us = 0;
+        if (s_client && online && !s_client_started && now >= retry_at_us) {
+            esp_err_t err = esp_mqtt_client_start(s_client);
+            if (err == ESP_OK) {
+                s_client_started = true;
+                ESP_LOGI(TAG, "Wi-Fi ready; MQTT started");
+            } else ESP_LOGW(TAG, "MQTT start failed: %s", esp_err_to_name(err));
+            retry_at_us = now + 3000000;
+        } else if (s_client && s_client_started) {
+            EventBits_t bits = xEventGroupGetBits(s_connection_events);
+            if (!online && (was_online || (bits & MQTT_CONNECTED_BIT))) {
+                esp_mqtt_client_disconnect(s_client);
+            } else if (online && (bits & MQTT_RETRY_BIT) && now >= retry_at_us) {
+                xEventGroupClearBits(s_connection_events, MQTT_RETRY_BIT);
+                if (esp_mqtt_client_reconnect(s_client) != ESP_OK) {
+                    xEventGroupSetBits(s_connection_events, MQTT_RETRY_BIT);
+                }
+                retry_at_us = now + 3000000;
+            }
+        }
+        was_online = online;
+        xSemaphoreGive(s_lock);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
 
 esp_err_t mqtt_control_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
+    s_connection_events = xEventGroupCreate();
     s_commands = xQueueCreate(8, sizeof(command_item_t));
-    if (!s_lock || !s_commands) return ESP_ERR_NO_MEM;
+    if (!s_lock || !s_commands || !s_connection_events) return ESP_ERR_NO_MEM;
     snprintf(s_topic_in, sizeof(s_topic_in), "to/recorder/%s", device_identity_id());
     snprintf(s_topic_out, sizeof(s_topic_out), "from/recorder/%s", device_identity_id());
     if (xTaskCreate(command_task, "mqtt_commands", 6144, NULL, 5, NULL) != pdPASS) return ESP_ERR_NO_MEM;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     esp_err_t err = create_client_locked();
     xSemaphoreGive(s_lock);
+    if (err == ESP_OK && xTaskCreate(connection_task, "mqtt_connection", 4096, NULL, 4, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
     return err;
 }
 
@@ -312,10 +378,18 @@ esp_err_t mqtt_control_reload(void)
     if (!s_lock) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (s_client) {
-        esp_mqtt_client_stop(s_client);
+        if (s_client_started) {
+            esp_err_t err = esp_mqtt_client_stop(s_client);
+            if (err != ESP_OK) {
+                xSemaphoreGive(s_lock);
+                return err;
+            }
+            s_client_started = false;
+        }
         esp_mqtt_client_destroy(s_client);
         s_client = NULL;
     }
+    xEventGroupClearBits(s_connection_events, MQTT_CONNECTED_BIT | MQTT_RETRY_BIT);
     esp_err_t err = create_client_locked();
     xSemaphoreGive(s_lock);
     return err;

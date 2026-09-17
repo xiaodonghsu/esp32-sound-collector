@@ -21,7 +21,9 @@ static void copy_string(char *dst, size_t dst_size, const char *src)
 static void read_string(nvs_handle_t nvs, const char *key, char *dst, size_t size)
 {
     size_t required = size;
-    if (nvs_get_str(nvs, key, dst, &required) != ESP_OK) dst[0] = '\0';
+    /* Missing keys retain their initialized defaults; a saved empty value is
+     * valid, notably for brokers without username/password authentication. */
+    nvs_get_str(nvs, key, dst, &required);
 }
 
 static esp_err_t write_string(nvs_handle_t nvs, const char *key, const char *value)
@@ -35,10 +37,10 @@ esp_err_t app_config_init(void)
     if (!s_lock) return ESP_ERR_NO_MEM;
 
     memset(&s_config, 0, sizeof(s_config));
-    strlcpy(s_config.mqtt_host, "192.168.4.244", sizeof(s_config.mqtt_host));
-    s_config.mqtt_port = 11883;
-    strlcpy(s_config.mqtt_username, "Recorders", sizeof(s_config.mqtt_username));
-    strlcpy(s_config.mqtt_password, "bestlink", sizeof(s_config.mqtt_password));
+    strlcpy(s_config.mqtt_host, APP_MQTT_DEFAULT_HOST, sizeof(s_config.mqtt_host));
+    s_config.mqtt_port = APP_MQTT_DEFAULT_PORT;
+    strlcpy(s_config.mqtt_username, APP_MQTT_DEFAULT_USERNAME, sizeof(s_config.mqtt_username));
+    strlcpy(s_config.mqtt_password, APP_MQTT_DEFAULT_PASSWORD, sizeof(s_config.mqtt_password));
     strlcpy(s_config.web_password, "bestlink", sizeof(s_config.web_password));
 
     nvs_handle_t nvs;
@@ -53,12 +55,10 @@ esp_err_t app_config_init(void)
     read_string(nvs, "mqtt_pass", s_config.mqtt_password, sizeof(s_config.mqtt_password));
     read_string(nvs, "web_pass", s_config.web_password, sizeof(s_config.web_password));
     uint16_t port;
-    if (nvs_get_u16(nvs, "mqtt_port", &port) == ESP_OK) s_config.mqtt_port = port;
+    if (nvs_get_u16(nvs, "mqtt_port", &port) == ESP_OK && port != 0) s_config.mqtt_port = port;
     nvs_close(nvs);
 
-    if (!s_config.mqtt_host[0]) strlcpy(s_config.mqtt_host, "192.168.4.244", sizeof(s_config.mqtt_host));
-    if (!s_config.mqtt_username[0]) strlcpy(s_config.mqtt_username, "Recorders", sizeof(s_config.mqtt_username));
-    if (!s_config.mqtt_password[0]) strlcpy(s_config.mqtt_password, "bestlink", sizeof(s_config.mqtt_password));
+    if (!s_config.mqtt_host[0]) strlcpy(s_config.mqtt_host, APP_MQTT_DEFAULT_HOST, sizeof(s_config.mqtt_host));
     if (!s_config.web_password[0]) strlcpy(s_config.web_password, "bestlink", sizeof(s_config.web_password));
     return ESP_OK;
 }
