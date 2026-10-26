@@ -57,10 +57,10 @@ static const char PAGE[] =
 "async function refreshOverview(){if($('refresh').disabled)return;$('refresh').disabled=true;try{let j=await api('/api/overview'),d=j.device,m=j.memory,s=j.sta,a=j.ap;"
 "rows('device',[['设备 ID',d.id],['ESP-IDF',d.idf],['固件版本',d.firmware],['固件编译时间',d.build_time],['固件 ELF SHA-256',d.elf_sha256],['芯片',d.chip],['芯片修订',d.revision],['CPU 核心数',d.cores],['运行时间',d.uptime_seconds+' 秒']]);"
 "rows('memory',[['Flash 实测容量',bytes(m.flash_bytes)],['Flash 构建配置',m.flash_config],['PSRAM 状态',m.psram_status],['PSRAM 检测容量',bytes(m.psram_bytes)],...heapRows('内部 RAM',m.internal),...heapRows('PSRAM',m.psram)]);"
-"rows('sta',[['状态',s.status],['SSID',s.ssid],['MAC',s.mac],['接入点 BSSID',s.bssid],['信号强度',s.rssi==null?null:s.rssi+' dBm'],['信道',s.channel],['IPv4',s.ip],['子网掩码',s.netmask],['网关',s.gateway]]);"
-"rows('ap',[['状态',a.enabled?'已启用':'未启用'],['SSID',a.ssid],['MAC',a.mac],['IPv4',a.ip],['子网掩码',a.netmask],['信道',a.channel],['安全模式',a.security],['已连接客户端',a.clients],['客户端上限',a.max_clients]]);$('overviewStatus').textContent='更新于 '+new Date().toLocaleTimeString()}catch(e){$('overviewStatus').textContent='刷新失败，显示内容可能已过期：'+e.message}finally{$('refresh').disabled=false}}"
+"rows('sta',[['状态',s.status],['SSID',s.ssid],['MAC',s.mac],['接入点 BSSID',s.bssid],['信号强度',s.rssi==null?null:s.rssi+' dBm'],['信道',s.channel],['频率',s.frequency_mhz?s.frequency_mhz+' MHz':null],['IPv4',s.ip],['子网掩码',s.netmask],['网关',s.gateway]]);"
+"rows('ap',[['状态',a.enabled?'已启用':'未启用'],['SSID',a.ssid],['MAC',a.mac],['IPv4',a.ip],['子网掩码',a.netmask],['信道',a.channel],['频率',a.frequency_mhz?a.frequency_mhz+' MHz':null],['安全模式',a.security],['已连接客户端',a.clients],['客户端上限',a.max_clients]]);$('overviewStatus').textContent='更新于 '+new Date().toLocaleTimeString()}catch(e){$('overviewStatus').textContent='刷新失败，显示内容可能已过期：'+e.message}finally{$('refresh').disabled=false}}"
 "async function init(){refreshOverview();try{let j=await api('/api/info');$('identity').textContent='设备 '+j.device_id+' · '+j.ap_ssid;$('host').value=j.mqtt_host;$('port').value=j.mqtt_port;$('user').value=j.mqtt_username}catch(e){note(e.message,false)}}"
-"async function scan(){try{note('正在扫描…');let j=await api('/api/scan');$('ssid').innerHTML='';j.networks.forEach(n=>{let o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+' ('+n.rssi+' dBm)';if(n.ssid===j.current)o.selected=true;$('ssid').appendChild(o)});note('扫描完成')}catch(e){note(e.message,false)}}"
+"async function scan(){try{note('正在扫描…');let j=await api('/api/scan');$('ssid').innerHTML='';let selected=false;j.networks.forEach(n=>{let o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+' ('+n.band+' · 信道 '+n.channel+' · '+n.frequency_mhz+' MHz · '+n.rssi+' dBm)';if(n.ssid===j.current&&!selected){o.selected=true;selected=true}$('ssid').appendChild(o)});note('扫描完成')}catch(e){note(e.message,false)}}"
 "async function post(u,b){return api(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}"
 "async function saveWifi(){try{note('正在验证连接，最长约 20 秒…');await post('/api/wifi',{ssid:$('ssid').value,password:$('wpass').value});note('Wi-Fi 已验证并保存')}catch(e){note(e.message,false)}}"
 "async function saveMqtt(){let b=$('mqttsave');b.disabled=true;try{note('正在保存 MQTT 通信参数…');await post('/api/mqtt',{host:$('host').value.trim(),port:Number($('port').value),username:$('user').value,password:$('mpass').value||null});$('mpass').value='';note('MQTT 参数已保存；Wi-Fi 联网后自动连接服务器')}catch(e){note(e.message,false)}finally{b.disabled=false}}"
@@ -267,6 +267,8 @@ static esp_err_t overview_get(httpd_req_t *req)
         add_mac(sta, "bssid", connected_ap.bssid);
         cJSON_AddNumberToObject(sta, "rssi", connected_ap.rssi);
         cJSON_AddNumberToObject(sta, "channel", connected_ap.primary);
+        unsigned frequency = wifi_manager_frequency_mhz(connected_ap.primary);
+        if (frequency) cJSON_AddNumberToObject(sta, "frequency_mhz", frequency);
     }
     // Do not expose a retained DHCP address when the station is offline.
     if (connected) add_ip_info(sta, sta_netif);
@@ -288,8 +290,11 @@ static esp_err_t overview_get(httpd_req_t *req)
         add_ip_info(ap, ap_netif);
         uint8_t primary;
         wifi_second_chan_t secondary;
-        if (esp_wifi_get_channel(&primary, &secondary) == ESP_OK)
+        if (esp_wifi_get_channel(&primary, &secondary) == ESP_OK) {
             cJSON_AddNumberToObject(ap, "channel", primary);
+            unsigned frequency = wifi_manager_frequency_mhz(primary);
+            if (frequency) cJSON_AddNumberToObject(ap, "frequency_mhz", frequency);
+        }
         wifi_sta_list_t clients;
         if (esp_wifi_ap_get_sta_list(&clients) == ESP_OK)
             cJSON_AddNumberToObject(ap, "clients", clients.num);
@@ -309,11 +314,23 @@ static esp_err_t scan_get(httpd_req_t *req)
     for (uint16_t i = 0; i < count; ++i) {
         if (!records[i].ssid[0]) continue;
         bool duplicate = false;
-        for (uint16_t k = 0; k < i; ++k) if (!strcmp((char *)records[k].ssid, (char *)records[i].ssid)) duplicate = true;
+        /* Keep the same SSID on different channels (including both bands). */
+        for (uint16_t k = 0; k < i; ++k) {
+            if (records[k].primary == records[i].primary &&
+                !strcmp((char *)records[k].ssid, (char *)records[i].ssid)) {
+                duplicate = true;
+                break;
+            }
+        }
         if (duplicate) continue;
         cJSON *n = cJSON_CreateObject();
         cJSON_AddStringToObject(n, "ssid", (char *)records[i].ssid);
         cJSON_AddNumberToObject(n, "rssi", records[i].rssi);
+        unsigned frequency = wifi_manager_frequency_mhz(records[i].primary);
+        cJSON_AddNumberToObject(n, "channel", records[i].primary);
+        cJSON_AddNumberToObject(n, "frequency_mhz", frequency);
+        cJSON_AddStringToObject(n, "band", frequency == 0 ? "未知频段" :
+                                frequency < 2500 ? "2.4 GHz" : "5 GHz");
         cJSON_AddItemToArray(networks, n);
     }
     free(records);

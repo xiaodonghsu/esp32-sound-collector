@@ -153,6 +153,9 @@ esp_err_t wifi_manager_init(void)
     ap.ap.pmf_cfg.required = false;
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap), TAG, "AP config");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+    ESP_RETURN_ON_ERROR(esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO), TAG, "dual-band mode");
+#endif
     ESP_RETURN_ON_FALSE(xTaskCreate(reconnect_task, "wifi_reconnect", 4096, NULL, 4, NULL) == pdPASS,
                         ESP_ERR_NO_MEM, TAG, "reconnect task");
     ESP_LOGI(TAG, "configuration AP %s at 192.168.100.1", device_identity_ap_ssid());
@@ -177,6 +180,13 @@ static esp_err_t apply_station(const char *ssid, const char *password)
     strlcpy((char *)sta.sta.ssid, ssid, sizeof(sta.sta.ssid));
     strlcpy((char *)sta.sta.password, password, sizeof(sta.sta.password));
     sta.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    sta.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+    /* Cover the full usable RSSI range: prefer a matching 5 GHz AP even
+     * when its signal is weaker, while retaining 2.4 GHz as a fallback. */
+    sta.sta.threshold.rssi_5g_adjustment = 128;
+#endif
     sta.sta.pmf_cfg.capable = true;
     sta.sta.pmf_cfg.required = false;
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta), TAG, "station config");
@@ -221,6 +231,25 @@ esp_err_t wifi_manager_test_and_save(const char *ssid, const char *password, uin
     return err;
 }
 
+unsigned wifi_manager_frequency_mhz(uint8_t channel)
+{
+    if (channel == 14) return 2484;
+    if (channel >= 1 && channel <= 13) return 2407 + 5 * channel;
+    if (channel >= 32 && channel <= 177) return 5000 + 5 * channel;
+    return 0;
+}
+
+static int compare_scan_records(const void *left, const void *right)
+{
+    const wifi_ap_record_t *a = left;
+    const wifi_ap_record_t *b = right;
+    /* ESP32-C5 supports 2.4 GHz (channels 1-14) and 5 GHz. */
+    bool a_5g = a->primary > 14;
+    bool b_5g = b->primary > 14;
+    if (a_5g != b_5g) return a_5g ? -1 : 1;
+    return (int)b->rssi - (int)a->rssi;
+}
+
 esp_err_t wifi_manager_scan(wifi_ap_record_t **records, uint16_t *count)
 {
     if (!records || !count) return ESP_ERR_INVALID_ARG;
@@ -238,6 +267,7 @@ esp_err_t wifi_manager_scan(wifi_ap_record_t **records, uint16_t *count)
         free(list);
         return err;
     }
+    qsort(list, found, sizeof(*list), compare_scan_records);
     *records = list;
     *count = found;
     return ESP_OK;

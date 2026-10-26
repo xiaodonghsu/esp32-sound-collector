@@ -1,5 +1,15 @@
 {
     "idf.currentSetup": "C:\\esp\\v6.0.2\\esp-idf",
     "idf.portWin": "COM10",
-    "idf.flashType": "UART"
+    "idf.flashType": "UART",
+    "idf.port": "COM13",
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32c5"
+    },
+    "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=c:\\Files\\Documents\\Projects\\playground-iot\\esp32\\esp32-4mic-array-collector\\build"
+    ]
 }

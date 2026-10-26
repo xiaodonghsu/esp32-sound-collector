@@ -1,4 +1,5 @@
 #include "xvf3800.h"
+#include "board_pins.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -10,8 +11,8 @@
 #include "esp_log.h"
 
 #define XVF_I2C_PORT       I2C_NUM_0
-#define XVF_I2C_SDA        5
-#define XVF_I2C_SCL        6
+#define XVF_I2C_SDA        BOARD_XVF_I2C_SDA
+#define XVF_I2C_SCL        BOARD_XVF_I2C_SCL
 #define XVF_I2C_ADDRESS    0x2c
 #define XVF_RES_GPO        20
 #define XVF_RES_APP        48

@@ -1,4 +1,5 @@
 #include "audio_stream.h"
+#include "board_pins.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -16,13 +17,20 @@
 #define AUDIO_RATE             16000
 #define AUDIO_BYTES_PER_SAMPLE 2
 #define AUDIO_INPUT_RATE       CONFIG_XVF_I2S_INPUT_RATE_HZ
-#define AUDIO_I2S_BCLK         8
-#define AUDIO_I2S_WS           7
-#define AUDIO_I2S_DOUT         44
-#define AUDIO_I2S_DIN          43
+#define AUDIO_I2S_BCLK         BOARD_AUDIO_I2S_BCLK
+#define AUDIO_I2S_WS           BOARD_AUDIO_I2S_WS
+#define AUDIO_I2S_DOUT         BOARD_AUDIO_I2S_DOUT
+#define AUDIO_I2S_DIN          BOARD_AUDIO_I2S_DIN
 #define AUDIO_EXIT_CAPTURE     BIT0
 #define AUDIO_EXIT_NETWORK     BIT1
 #define AUDIO_WS_CONNECTED     BIT2
+
+/* Respect the configured core count, including single-core builds on dual-core chips. */
+#if configNUMBER_OF_CORES > 1
+#define AUDIO_NETWORK_CORE     1
+#else
+#define AUDIO_NETWORK_CORE     0
+#endif
 
 static const char *TAG = "audio_stream";
 static SemaphoreHandle_t s_lock;
@@ -273,7 +281,7 @@ esp_err_t audio_stream_start(const char *url, uint32_t segment_ms,
         return err;
     }
     s_running = true;
-    BaseType_t network_ok = xTaskCreatePinnedToCore(network_task, "audio_ws", 6144, NULL, 6, NULL, 1);
+    BaseType_t network_ok = xTaskCreatePinnedToCore(network_task, "audio_ws", 6144, NULL, 6, NULL, AUDIO_NETWORK_CORE);
     if (network_ok != pdPASS) {
         s_running = false;
         i2s_channel_disable(s_rx);

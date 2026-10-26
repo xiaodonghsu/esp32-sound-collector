@@ -14,6 +14,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "mqtt_client.h"
 #include "app_config.h"
 #include "audio_stream.h"
@@ -46,8 +47,30 @@ typedef struct {
     uint32_t channels;
 } audio_url_params_t;
 
+static void add_wifi_radio_info(cJSON *json)
+{
+    if (!json) return;
+    /* Take one association snapshot for every uplink response. These fields
+     * describe message creation time, even if the outbox sends it later. */
+    wifi_ap_record_t ap;
+    unsigned frequency = esp_wifi_sta_get_ap_info(&ap) == ESP_OK ?
+                         wifi_manager_frequency_mhz(ap.primary) : 0;
+    if (frequency) {
+        cJSON_AddStringToObject(json, "wifi-band", frequency < 2500 ? "2.4 GHz" : "5 GHz");
+        cJSON_AddNumberToObject(json, "wifi-channel", ap.primary);
+        cJSON_AddNumberToObject(json, "wifi-frequency-mhz", frequency);
+    } else {
+        cJSON_AddNullToObject(json, "wifi-band");
+        cJSON_AddNullToObject(json, "wifi-channel");
+        cJSON_AddNullToObject(json, "wifi-frequency-mhz");
+    }
+}
+
 static void publish_json(cJSON *json)
 {
+    if (!json) return;
+    /* Status inserts radio information alongside its other Wi-Fi fields. */
+    if (!cJSON_HasObjectItem(json, "wifi-band")) add_wifi_radio_info(json);
     char *text = cJSON_PrintUnformatted(json);
     cJSON_Delete(json);
     if (!text) return;
@@ -169,6 +192,7 @@ static void handle_status(const char *mid)
     cJSON_AddStringToObject(j, "mid", mid);
     cJSON_AddStringToObject(j, "result", "success");
     cJSON_AddStringToObject(j, "wifi-ssid", ssid);
+    add_wifi_radio_info(j);
     cJSON_AddNumberToObject(j, "wifi-rssi", wifi_manager_rssi());
     cJSON_AddStringToObject(j, "wifi-mac", device_identity_id());
     cJSON_AddStringToObject(j, "wifi-ipaddr", ip);

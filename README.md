@@ -1,31 +1,43 @@
 # ESP32 4-Mic Array Collector
 
-XIAO ESP32-S3 + reSpeaker XVF3800 录音终端。工程基于 ESP-IDF 6（已在 6.0.2 构建验证），包含：
+XIAO ESP32-S3 / ESP32-C5 + reSpeaker XVF3800 录音终端。工程基于 ESP-IDF 6（已在 6.0.2 构建验证），包含：
 
 - 始终启用的 `Bestlink-xxxxxx` SoftAP（`192.168.100.1`）和分页配置页面；
-- NVS 持久化、Wi-Fi 扫描和保存前连接验证；
+- NVS 持久化、2.4/5 GHz Wi-Fi 扫描（显示频段、信道和主信道中心频率）和保存前连接验证；
 - MQTT `start` / `stop` / `status` / `set` 控制面；
 - XVF3800 I2C 版本、LED 参数读取和设置；
 - I2S 采集任务、Audio Ring Buffer、WebSocket 发送任务及自动重连。
 
 ## 硬件和音频格式
 
-| 信号 | ESP32-S3 GPIO |
-|---|---:|
-| I2C SDA / SCL | 5 / 6 |
-| I2S BCLK / WS | 8 / 7 |
-| I2S DOUT / DIN | 44 / 43 |
+`main/board_pins.h` 根据 ESP-IDF 目标芯片（`CONFIG_IDF_TARGET_ESP32S3` / `CONFIG_IDF_TARGET_ESP32C5`）自动选择 GPIO，I2C 控制与 I2S 音频驱动共用此映射。两块 XIAO 使用相同的板上 D 引脚位置连接 XVF3800，无需手动修改驱动中的 GPIO；其他目标芯片会在编译时报错。
 
-工程默认匹配 Seeed 的录音/回放例程：ESP32-S3 作为 I2S master 输出 BCLK/WS，采样格式为 16 kHz、stereo、32-bit、Philips I2S。采集时取左声道高 16 bit，向 WebSocket 发送裸 PCM：16 kHz、signed 16-bit little-endian、mono。WebSocket 每个 binary message 对应一个音频分段。如需以 48 kHz 采集，可在 `idf.py menuconfig` 的 `Bestlink recorder` 中修改输入采样率，工程会降采样到 16 kHz。
+| XIAO 引脚 | ESP32-S3 GPIO | ESP32-C5 GPIO | 本项目用途（ESP32 视角） |
+|---|---:|---:|---|
+| D4 | 5 | 23 | I2C SDA |
+| D5 | 6 | 24 | I2C SCL |
+| D6 | 43 | 11 | I2S DIN（接收 XVF3800 音频） |
+| D7 | 44 | 12 | I2S DOUT |
+| D8 | 7 | 8 | I2S WS |
+| D9 | 8 | 9 | I2S BCLK |
+| D10 | 9 | 10 | 预留，当前未使用 |
+
+表中的数字为芯片 GPIO 编号；板上 UART/SPI 标注是复用功能，本项目将 D6–D9 配置为 I2S。该适配以所列 XIAO 引脚连接为前提，C5 的实际录音及 XVF3800 通信仍需实机验证。
+
+工程默认匹配 Seeed 的录音/回放例程：ESP32 作为 I2S master 输出 BCLK/WS，采样格式为 16 kHz、stereo、32-bit、Philips I2S。采集时取左声道高 16 bit，向 WebSocket 发送裸 PCM：16 kHz、signed 16-bit little-endian、mono。WebSocket 每个 binary message 对应一个音频分段。如需以 48 kHz 采集，可在 `idf.py menuconfig` 的 `Bestlink recorder` 中修改输入采样率，工程会降采样到 16 kHz。
 
 ## 编译
 
 ```powershell
-# 先进入 ESP-IDF 5.3+ 环境
-idf.py set-target esp32s3
+# 先进入 ESP-IDF 6.0.2 环境
+# XIAO ESP32-C5
+idf.py set-target esp32c5
+# XIAO ESP32-S3 则使用：idf.py set-target esp32s3
 idf.py build
 idf.py -p COMx flash monitor
 ```
+
+`sdkconfig.defaults` 当前默认目标为 ESP32-C5；切换开发板时执行对应的 `set-target`，引脚映射随目标自动切换。S3 仅支持 2.4 GHz Wi-Fi，双频功能仅适用于 C5。
 
 工程固定引用官方 `esp-mqtt` 与 `esp_websocket_client` 源码，避免构建机依赖在线组件仓库。默认分区按 8 MB Flash 设置，如设备容量不同请修改 `sdkconfig.defaults` 和 `partitions.csv`。
 
@@ -33,7 +45,7 @@ idf.py -p COMx flash monitor
 
 ### PSRAM 容量检查
 
-工程启用 Octal PSRAM（80 MHz）、自动识别容量、启动初始化及 ESP-IDF 内存测试。PSRAM 加入 `heap_caps` 分配器，普通 `malloc()` 仍默认使用内部 RAM。初始化失败时继续使用内部 RAM，管理页面会报告不可用；不能把初始化失败解释为硬件容量为零。
+工程按 ESP32-C5 配置 Quad PSRAM（80 MHz）、启动初始化及 ESP-IDF 内存测试。PSRAM 加入 `heap_caps` 分配器，普通 `malloc()` 仍默认使用内部 RAM。初始化失败时继续使用内部 RAM，管理页面会报告不可用；不能把初始化失败解释为硬件容量为零。
 
 烧录并重启后，在串口日志中查看 `PSRAM detected: ... bytes (... KiB)`。8 MiB 对应 `8388608 bytes (8192 KiB)`，这只是预期示例，实际容量以设备检测结果为准。也可登录“设备概览”，查看“PSRAM 状态”“PSRAM 检测容量”和 PSRAM 堆统计；可用堆空间不等于物理容量。
 
@@ -45,12 +57,14 @@ idf.py -p COMx flash monitor
 2. 浏览器访问 `http://192.168.100.1`。
 3. 使用 `admin` / `bestlink` 登录，默认进入“设备概览”，其余分页用于配置 Wi-Fi、MQTT、登录密码和固件升级。
 
+Wi-Fi 扫描列表显示例如 `Office (5 GHz · 信道 36 · 5180 MHz · -55 dBm)`；列表先显示 5 GHz，再显示 2.4 GHz，各频段内按 RSSI 从高到低排序（例如 -40 dBm 排在 -70 dBm 前）。同名 SSID 在不同信道上分别显示，同名且同信道的结果保留信号最强的一个。频率是主信道的中心频率（例如信道 1 为 2412 MHz，信道 14 为 2484 MHz），不是绑定宽信道的中心频率。保存时仍按 SSID 连接，不锁定所显示的频段或信道。首次连接及断线重连使用全信道扫描、按信号排序，并将 `rssi_5g_adjustment` 设置为 128，使同名双频网络优先尝试 5 GHz，保留 2.4 GHz 作为回退；已连接时不会因为页面扫描主动切换网络。默认选中已保存 SSID 中排序最靠前的条目。实际可扫描信道受国家/地区配置限制。C5 启用 `WIFI_BAND_MODE_AUTO`，支持在 2.4/5 GHz 间选择；APSTA 共用射频，连接 5 GHz 上行后配置热点也会跟随上行信道。
+
 “设备概览”按以下类别显示实时信息，进入分页或点击“刷新概览”重新读取：
 
 - 设备与固件：设备 ID、ESP-IDF 版本、固件版本、芯片型号与修订、CPU 核心数、运行时间。
 - 存储与内存：Flash 实测容量和构建配置；PSRAM 初始化状态与检测容量；内部 RAM、PSRAM 的总堆内存、当前可用量、启动以来最低可用量、最大连续可分配块（同时显示 KiB/MiB 和字节）。内部 RAM 统计限定为支持字节访问的内部堆，不代表芯片全部物理 SRAM；未启用 PSRAM 时不能据此判断硬件是否存在。
-- STA 上行连接：连接/IP 获取状态、SSID、MAC、接入点 BSSID、RSSI、信道、IPv4、子网掩码和网关。断开时不展示旧 IP。
-- Soft AP 配置热点：启用状态、SSID、MAC、IPv4、子网掩码、当前实际信道、安全模式、连接客户端数量及上限。
+- STA 上行连接：连接/IP 获取状态、SSID、MAC、接入点 BSSID、RSSI、信道、频率（主信道中心频率，MHz）、IPv4、子网掩码和网关。断开时不展示旧 IP、信道或频率。
+- Soft AP 配置热点：启用状态、SSID、MAC、IPv4、子网掩码、当前实际信道和频率（MHz）、安全模式、连接客户端数量及上限。热点关闭或频率读取失败时显示“不可用”。
 
 概览接口 `/api/overview` 使用与管理页面相同的登录认证，不返回网络密码。打开概览不会自动触发 Wi-Fi 扫描。
 
@@ -66,6 +80,8 @@ idf.py -p COMx flash monitor
 保存后写入 NVS，重启后保留，并自动应用到 MQTT 客户端。密码不回显，输入框留空表示保留当前密码；首次配置留空则继续使用默认密码。保存成功表示参数已保存并应用，实际连接还取决于 Wi-Fi 和 MQTT 服务器是否可用。
 
 设备 ID 是 Wi-Fi STA MAC 的 12 位小写十六进制字符串。MQTT Client ID 与设备 ID 相同；订阅 `to/recorder/<设备ID>`，响应到 `from/recorder/<设备ID>`。
+
+所有 MQTT 上行响应（包括 `start`、`stop`、`status`、`set` 及错误响应）统一携带当前 STA Wi-Fi 信息：`wifi-band` 为 `"2.4 GHz"` 或 `"5 GHz"`，`wifi-channel` 为信道号，`wifi-frequency-mhz` 为主信道中心频率（MHz，JSON 数字）。例如：`{"mid":"123","result":"success","wifi-band":"5 GHz","wifi-channel":36,"wifi-frequency-mhz":5180}`。未关联接入点或无法读取有效信道时，这三个字段均为 JSON `null`。信息取自消息生成时的连接快照，离线队列稍后发送时不会改写为新的连接信息。
 
 ## 无人值守断线恢复
 

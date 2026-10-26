@@ -14,6 +14,8 @@ esp_err_t wifi_manager_test_and_save(const char *ssid, const char *password, uin
 esp_err_t wifi_manager_scan(wifi_ap_record_t **records, uint16_t *count);
 bool wifi_manager_is_connected(void);
 int wifi_manager_rssi(void);
+/* Primary-channel center frequency in MHz; 0 for an unknown channel. */
+unsigned wifi_manager_frequency_mhz(uint8_t channel);
 void wifi_manager_ip(char *out, size_t size);
 void wifi_manager_ssid(char *out, size_t size);
 void wifi_manager_set_state_callback(wifi_manager_state_cb_t callback, void *ctx);
