@@ -3,3 +3,6 @@
 /sdkconfig.old
 *.log
 /components
+# Dependency lock file
+dependencies.lock
+/.vscode
