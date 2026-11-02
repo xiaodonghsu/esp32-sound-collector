@@ -10,6 +10,7 @@
 #define CONFIG_NAMESPACE "recorder"
 
 static app_config_t s_config;
+static app_wifi_setup_result_t s_wifi_setup;
 static SemaphoreHandle_t s_lock;
 
 static void copy_string(char *dst, size_t dst_size, const char *src)
@@ -56,7 +57,18 @@ esp_err_t app_config_init(void)
     read_string(nvs, "web_pass", s_config.web_password, sizeof(s_config.web_password));
     uint16_t port;
     if (nvs_get_u16(nvs, "mqtt_port", &port) == ESP_OK && port != 0) s_config.mqtt_port = port;
+    size_t result_size = sizeof(s_wifi_setup);
+    if (nvs_get_blob(nvs, "wifi_setup", &s_wifi_setup, &result_size) != ESP_OK ||
+        result_size != sizeof(s_wifi_setup)) memset(&s_wifi_setup, 0, sizeof(s_wifi_setup));
+    s_wifi_setup.state[sizeof(s_wifi_setup.state) - 1] = '\0';
+    s_wifi_setup.ssid[sizeof(s_wifi_setup.ssid) - 1] = '\0';
+    s_wifi_setup.message[sizeof(s_wifi_setup.message) - 1] = '\0';
     nvs_close(nvs);
+    if (!strcmp(s_wifi_setup.state, "pending")) {
+        strlcpy(s_wifi_setup.state, "fail", sizeof(s_wifi_setup.state));
+        strlcpy(s_wifi_setup.message, "上次连接验证被设备重启中断，请重新提交配置。", sizeof(s_wifi_setup.message));
+        ESP_RETURN_ON_ERROR(app_config_set_wifi_setup_result(&s_wifi_setup), "config", "save interrupted setup");
+    }
 
     if (!s_config.mqtt_host[0]) strlcpy(s_config.mqtt_host, APP_MQTT_DEFAULT_HOST, sizeof(s_config.mqtt_host));
     if (!s_config.web_password[0]) strlcpy(s_config.web_password, "bestlink", sizeof(s_config.web_password));
@@ -128,5 +140,28 @@ esp_err_t app_config_set_web_password(const char *password)
         copy_string(s_config.web_password, sizeof(s_config.web_password), password);
         xSemaphoreGive(s_lock);
     }
+    return err;
+}
+
+void app_config_get_wifi_setup_result(app_wifi_setup_result_t *out)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    *out = s_wifi_setup;
+    xSemaphoreGive(s_lock);
+}
+
+esp_err_t app_config_set_wifi_setup_result(const app_wifi_setup_result_t *result)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(CONFIG_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(nvs, "wifi_setup", result, sizeof(*result));
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    /* Keep the current result visible even if flash fails. */
+    s_wifi_setup = *result;
+    xSemaphoreGive(s_lock);
     return err;
 }

@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_check.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -23,6 +26,12 @@
 
 static const char *TAG = "web_config";
 static httpd_handle_t s_server;
+static SemaphoreHandle_t s_wifi_setup_slot;
+static SemaphoreHandle_t s_scan_lock;
+static const char *s_scan_state = "idle";
+static esp_err_t s_scan_error;
+static wifi_ap_record_t *s_scan_records;
+static uint16_t s_scan_count;
 
 #define STRINGIFY_VALUE_(value) #value
 #define STRINGIFY_VALUE(value) STRINGIFY_VALUE_(value)
@@ -37,7 +46,7 @@ static const char PAGE[] =
 "#msg{min-height:24px;margin-top:14px}.ok{color:#08783e}.bad{color:#b42318}</style></head><body><main>"
 "<h1>Bestlink 4-Mic Recorder</h1><div id=identity></div><div class=tabs><button onclick='show(0)'>设备概览</button><button class=off onclick='show(1)'>Wi-Fi</button><button class=off onclick='show(2)'>MQTT 通信参数</button><button class=off onclick='show(3)'>登录密码</button><button class=off onclick='show(4)'>固件升级</button></div>"
 "<section class='card page on'><h2>设备概览</h2><button id=refresh onclick=refreshOverview()>刷新概览</button><p id=overviewStatus role=status>正在读取…</p><h3>设备与固件</h3><dl id=device></dl><h3>存储与内存</h3><dl id=memory></dl><p>内存统计为可分配的堆内存；历史最低可用量从本次启动起统计。</p><h3>STA · 上行 Wi-Fi</h3><dl id=sta></dl><h3>Soft AP · 配置热点</h3><dl id=ap></dl></section>"
-"<section class='card page'><h2>Wi-Fi 设置</h2><button onclick=scan()>扫描附近网络</button><label>SSID</label><select id=ssid></select><label>Wi-Fi 密码</label><input id=wpass type=password autocomplete=new-password><button onclick=saveWifi()>验证并保存</button></section>"
+"<section class='card page'><h2>Wi-Fi 设置</h2><p id=wifiStatus role=status></p><button type=button onclick=loadWifi()>刷新连接结果</button><button id=scanbutton type=button onclick=scan()>扫描附近网络</button><p id=scanStatus role=status></p><label for=networks>扫描结果（选择后填入 SSID，也可直接手动输入）</label><select id=networks onchange=chooseNetwork()><option value=''>请选择网络</option></select><p>选择扫描结果或手动输入网络名称和密码。提交后 Wi-Fi 可能中断，请重新连接 Bestlink 热点并访问 192.168.100.1，在本页查看结果。</p><form onsubmit='event.preventDefault();saveWifi()'><label for=ssid>SSID</label><input id=ssid required maxlength=32 autocomplete=off><label for=wpass>Wi-Fi 密码（开放网络可留空）</label><input id=wpass type=password maxlength=64 autocomplete=new-password><button id=wifisave type=submit>验证并保存</button></form></section>"
 "<section class='card page'><h2>MQTT 通信参数</h2><p>保存后自动使用新参数连接，无需重启设备。</p>"
 "<form onsubmit='event.preventDefault();saveMqtt()'><label for=host>服务器地址（IP 或域名）</label><input id=host required maxlength=128 autocomplete=off>"
 "<label for=port>端口号（1–65535）</label><input id=port type=number required min=1 max=65535 step=1>"
@@ -49,7 +58,7 @@ static const char PAGE[] =
 "<section class='card page'><h2>固件升级</h2><p>选择本项目的 esp32_4mic_array_collector.bin 应用固件（不能使用 bootloader、分区表或合并烧录包）。升级会停止录音，保留网络和登录配置，校验成功后自动重启。</p>"
 "<p id=otaInfo role=status>正在读取分区信息…</p><label for=firmware>应用固件（.bin）</label><input id=firmware type=file accept='.bin,application/octet-stream'>"
 "<p>升级期间请保持供电和连接。失败后需重新上传，录音需重新发送 start 指令。</p><button id=upgrade disabled onclick=uploadFirmware()>上传并升级</button><progress id=otaProgress max=100 value=0 style='width:100%;margin-top:16px'></progress><p id=otaStatus role=status></p></section><div id=msg></div>"
-"<script>const $=id=>document.getElementById(id);function show(n){document.querySelectorAll('.page').forEach((e,i)=>e.classList.toggle('on',i===n));document.querySelectorAll('.tabs button').forEach((e,i)=>e.classList.toggle('off',i!==n));if(n===0)refreshOverview();if(n===1&&!$('ssid').options.length)scan();if(n===4&&!otaBusy)loadOta()}"
+"<script>const $=id=>document.getElementById(id);function show(n){document.querySelectorAll('.page').forEach((e,i)=>e.classList.toggle('on',i===n));document.querySelectorAll('.tabs button').forEach((e,i)=>e.classList.toggle('off',i!==n));if(n===0)refreshOverview();if(n===1){loadWifi();loadScan()}if(n===4&&!otaBusy)loadOta()}"
 "function note(s,ok=true){$('msg').textContent=s;$('msg').className=ok?'ok':'bad'}async function api(u,o){let r=await fetch(u,o);let j=await r.json().catch(()=>({error:r.statusText}));if(!r.ok)throw Error(j.error||'请求失败');return j}"
 "function rows(id,items){$(id).replaceChildren();items.forEach(([k,v])=>{let dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v==null?'不可用':v;$(id).append(dt,dd)})}"
 "function bytes(n){return n==null?'不可用':(n/1024/(n>=1048576?1024:1)).toFixed(2)+(n>=1048576?' MiB':' KiB')+' ('+n+' B)'}"
@@ -60,9 +69,12 @@ static const char PAGE[] =
 "rows('sta',[['状态',s.status],['SSID',s.ssid],['MAC',s.mac],['接入点 BSSID',s.bssid],['信号强度',s.rssi==null?null:s.rssi+' dBm'],['信道',s.channel],['频率',s.frequency_mhz?s.frequency_mhz+' MHz':null],['IPv4',s.ip],['子网掩码',s.netmask],['网关',s.gateway]]);"
 "rows('ap',[['状态',a.enabled?'已启用':'未启用'],['SSID',a.ssid],['MAC',a.mac],['IPv4',a.ip],['子网掩码',a.netmask],['信道',a.channel],['频率',a.frequency_mhz?a.frequency_mhz+' MHz':null],['安全模式',a.security],['已连接客户端',a.clients],['客户端上限',a.max_clients]]);$('overviewStatus').textContent='更新于 '+new Date().toLocaleTimeString()}catch(e){$('overviewStatus').textContent='刷新失败，显示内容可能已过期：'+e.message}finally{$('refresh').disabled=false}}"
 "async function init(){refreshOverview();try{let j=await api('/api/info');$('identity').textContent='设备 '+j.device_id+' · '+j.ap_ssid;$('host').value=j.mqtt_host;$('port').value=j.mqtt_port;$('user').value=j.mqtt_username}catch(e){note(e.message,false)}}"
-"async function scan(){try{note('正在扫描…');let j=await api('/api/scan');$('ssid').innerHTML='';let selected=false;j.networks.forEach(n=>{let o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+' ('+n.band+' · 信道 '+n.channel+' · '+n.frequency_mhz+' MHz · '+n.rssi+' dBm)';if(n.ssid===j.current&&!selected){o.selected=true;selected=true}$('ssid').appendChild(o)});note('扫描完成')}catch(e){note(e.message,false)}}"
+"let scanTimer=0,scanBusy=false;function chooseNetwork(){if($('networks').value)$('ssid').value=$('networks').value}"
+"async function loadScan(){clearTimeout(scanTimer);try{let j=await api('/api/scan');scanBusy=j.state==='pending';$('scanbutton').disabled=scanBusy;if(scanBusy){$('scanStatus').textContent='正在扫描，Wi-Fi 可能短暂中断；重连后可在此查看结果。';scanTimer=setTimeout(loadScan,1000);return}if(j.state==='fail'){$('scanStatus').textContent=j.message;return}if(j.state!=='success')return;let list=$('networks');list.replaceChildren();let hint=document.createElement('option');hint.value='';hint.textContent='请选择网络，或手动输入 SSID';list.appendChild(hint);j.networks.forEach(n=>{let o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+' ('+n.band+' · 信道 '+n.channel+' · '+n.frequency_mhz+' MHz · '+n.rssi+' dBm)';list.appendChild(o)});list.value='';$('scanStatus').textContent=j.networks.length?'扫描完成，请选择网络或手动输入 SSID。':'未发现网络，可重新扫描或手动输入 SSID。'}catch(e){scanBusy=false;$('scanbutton').disabled=false;$('scanStatus').textContent='扫描结果读取失败：'+e.message+'。请重新连接热点，重新进入 Wi-Fi 页查看结果，也可手动输入 SSID。'}}"
+"async function scan(){if($('scanbutton').disabled)return;$('scanbutton').disabled=true;try{$('scanStatus').textContent='正在提交扫描，Wi-Fi 可能短暂中断。';await post('/api/scan',{});await loadScan()}catch(e){$('scanbutton').disabled=false;$('scanStatus').textContent='扫描响应未确认：'+e.message+'。请重连热点后重新进入本页查看结果，也可手动输入 SSID。'}}"
+"async function loadWifi(){try{let j=await api('/api/wifi');if(!$('ssid').value)$('ssid').value=j.ssid||j.current||'';$('wifisave').disabled=j.state==='pending';$('wifiStatus').className=j.state==='fail'?'bad':'ok';$('wifiStatus').textContent=j.state==='fail'?'上次连接 '+j.ssid+' 失败：'+j.message:j.state==='pending'?'正在验证 '+j.ssid+'，Wi-Fi 可能中断，请稍后重新连接并进入本页查看结果。':j.state==='success'?'上次配置 '+j.ssid+' 已验证并保存。':''}catch(e){$('wifiStatus').textContent='读取配置结果失败：'+e.message}}"
 "async function post(u,b){return api(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})}"
-"async function saveWifi(){try{note('正在验证连接，最长约 20 秒…');await post('/api/wifi',{ssid:$('ssid').value,password:$('wpass').value});note('Wi-Fi 已验证并保存')}catch(e){note(e.message,false)}}"
+"async function saveWifi(){let b=$('wifisave');if(b.disabled)return;let ssid=$('ssid').value,password=$('wpass').value;if(!ssid||new TextEncoder().encode(ssid).length>32||new TextEncoder().encode(password).length>64){$('wifiStatus').textContent='SSID 需为 1–32 字节，密码不能超过 64 字节';return}b.disabled=true;$('wifiStatus').className='ok';$('wifiStatus').textContent='正在提交。Wi-Fi 可能中断，请重新连接 Bestlink 热点并进入本页查看结果。';try{await post('/api/wifi',{ssid,password});$('wpass').value='';$('wifiStatus').textContent='配置已受理，设备正在验证连接。Wi-Fi 可能中断，请等待约 20 秒后重新连接热点，在本页查看结果。'}catch(e){b.disabled=false;$('wifiStatus').textContent='提交响应未确认：'+e.message+'。若 Wi-Fi 已中断，请重新连接热点并进入本页确认结果后再重试。'}}"
 "async function saveMqtt(){let b=$('mqttsave');b.disabled=true;try{note('正在保存 MQTT 通信参数…');await post('/api/mqtt',{host:$('host').value.trim(),port:Number($('port').value),username:$('user').value,password:$('mpass').value||null});$('mpass').value='';note('MQTT 参数已保存；Wi-Fi 联网后自动连接服务器')}catch(e){note(e.message,false)}finally{b.disabled=false}}"
 "async function savePassword(){try{await post('/api/password',{password:$('newpass').value});note('密码已修改，下次请求需使用新密码')}catch(e){note(e.message,false)}}"
 "let otaLimit=0,otaBusy=false;async function loadOta(){try{let j=await api('/api/ota');otaLimit=j.available?j.max_bytes:0;$('otaInfo').textContent=j.available?'当前分区：'+j.running+'；固件上限：'+bytes(j.max_bytes):'尚未配置 OTA 分区，请先通过 USB 烧录';$('upgrade').disabled=!otaLimit}catch(e){otaLimit=0;$('upgrade').disabled=true;$('otaInfo').textContent=e.message}}"
@@ -303,41 +315,129 @@ static esp_err_t overview_get(httpd_req_t *req)
     return send_json(req, j, NULL);
 }
 
+static void wifi_scan_task(void *arg)
+{
+    (void)arg;
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    wifi_ap_record_t *records = NULL;
+    uint16_t count = 0;
+    esp_err_t err = wifi_manager_scan(&records, &count);
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    free(s_scan_records);
+    s_scan_records = records;
+    s_scan_count = count;
+    s_scan_error = err;
+    s_scan_state = err == ESP_OK ? "success" : "fail";
+    xSemaphoreGive(s_scan_lock);
+    xSemaphoreGive(s_wifi_setup_slot);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t scan_post(httpd_req_t *req)
+{
+    if (require_auth(req) != ESP_OK) return ESP_OK;
+    /* Consume the small JSON body so keep-alive requests remain synchronized. */
+    cJSON *body = receive_json(req);
+    if (!body) return send_error(req, "400 Bad Request", "无效 JSON");
+    cJSON_Delete(body);
+    if (xSemaphoreTake(s_wifi_setup_slot, 0) != pdTRUE)
+        return send_error(req, "409 Conflict", "正在扫描或验证 Wi-Fi，请稍后重试");
+    TaskHandle_t task = NULL;
+    if (xTaskCreate(wifi_scan_task, "wifi_scan", 4096, NULL, 4, &task) != pdPASS) {
+        xSemaphoreGive(s_wifi_setup_slot);
+        return send_error(req, "503 Service Unavailable", "无法创建扫描任务，请稍后重试");
+    }
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    s_scan_state = "pending";
+    xSemaphoreGive(s_scan_lock);
+    cJSON *ok = cJSON_CreateObject();
+    cJSON_AddBoolToObject(ok, "accepted", true);
+    esp_err_t response = send_json(req, ok, "202 Accepted");
+    xTaskNotifyGive(task);
+    return response;
+}
+
 static esp_err_t scan_get(httpd_req_t *req)
 {
     if (require_auth(req) != ESP_OK) return ESP_OK;
-    wifi_ap_record_t *records = NULL;
-    uint16_t count = 0;
-    if (wifi_manager_scan(&records, &count) != ESP_OK) return send_error(req, "503 Service Unavailable", "Wi-Fi 扫描失败");
     cJSON *j = cJSON_CreateObject();
     cJSON *networks = cJSON_AddArrayToObject(j, "networks");
-    for (uint16_t i = 0; i < count; ++i) {
-        if (!records[i].ssid[0]) continue;
-        bool duplicate = false;
-        /* Keep the same SSID on different channels (including both bands). */
-        for (uint16_t k = 0; k < i; ++k) {
-            if (records[k].primary == records[i].primary &&
-                !strcmp((char *)records[k].ssid, (char *)records[i].ssid)) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate) continue;
-        cJSON *n = cJSON_CreateObject();
-        cJSON_AddStringToObject(n, "ssid", (char *)records[i].ssid);
-        cJSON_AddNumberToObject(n, "rssi", records[i].rssi);
-        unsigned frequency = wifi_manager_frequency_mhz(records[i].primary);
-        cJSON_AddNumberToObject(n, "channel", records[i].primary);
-        cJSON_AddNumberToObject(n, "frequency_mhz", frequency);
-        cJSON_AddStringToObject(n, "band", frequency == 0 ? "未知频段" :
-                                frequency < 2500 ? "2.4 GHz" : "5 GHz");
-        cJSON_AddItemToArray(networks, n);
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    cJSON_AddStringToObject(j, "state", s_scan_state);
+    if (s_scan_error != ESP_OK && !strcmp(s_scan_state, "fail")) {
+        char message[160];
+        snprintf(message, sizeof(message), "扫描失败：%s，请稍后重试或手动输入 SSID", esp_err_to_name(s_scan_error));
+        cJSON_AddStringToObject(j, "message", message);
     }
-    free(records);
-    app_config_t cfg;
-    app_config_get(&cfg);
-    cJSON_AddStringToObject(j, "current", cfg.wifi_ssid);
+    if (!strcmp(s_scan_state, "success")) {
+        for (uint16_t i = 0; i < s_scan_count; ++i) {
+            const wifi_ap_record_t *ap = &s_scan_records[i];
+            if (!ap->ssid[0]) continue;
+            bool duplicate = false;
+            for (uint16_t k = 0; k < i; ++k) {
+                if (s_scan_records[k].primary == ap->primary &&
+                    !strcmp((const char *)s_scan_records[k].ssid, (const char *)ap->ssid)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            cJSON *n = cJSON_CreateObject();
+            cJSON_AddStringToObject(n, "ssid", (const char *)ap->ssid);
+            cJSON_AddNumberToObject(n, "rssi", ap->rssi);
+            cJSON_AddNumberToObject(n, "channel", ap->primary);
+            unsigned frequency = wifi_manager_frequency_mhz(ap->primary);
+            cJSON_AddNumberToObject(n, "frequency_mhz", frequency);
+            cJSON_AddStringToObject(n, "band", ap->primary > 14 ? "5 GHz" : "2.4 GHz");
+            cJSON_AddItemToArray(networks, n);
+        }
+    }
+    xSemaphoreGive(s_scan_lock);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return send_json(req, j, NULL);
+}
+
+static esp_err_t wifi_get(httpd_req_t *req)
+{
+    if (require_auth(req) != ESP_OK) return ESP_OK;
+    app_wifi_setup_result_t result;
+    app_config_get_wifi_setup_result(&result);
+    app_config_t config;
+    app_config_get(&config);
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddStringToObject(j, "state", result.state);
+    cJSON_AddStringToObject(j, "ssid", result.ssid);
+    cJSON_AddStringToObject(j, "message", result.message);
+    cJSON_AddStringToObject(j, "current", config.wifi_ssid);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return send_json(req, j, NULL);
+}
+
+typedef struct {
+    char ssid[APP_SSID_MAX_LEN + 1];
+    char password[APP_WIFI_PASS_MAX_LEN + 1];
+} wifi_setup_request_t;
+
+static void wifi_setup_task(void *arg)
+{
+    wifi_setup_request_t *request = arg;
+    /* Begin only after the HTTP response. A lost response does not cancel setup. */
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    app_wifi_setup_result_t result = {0};
+    strlcpy(result.ssid, request->ssid, sizeof(result.ssid));
+    esp_err_t err = wifi_manager_test_and_save_detailed(request->ssid, request->password,
+                                                       20000, result.message, sizeof(result.message));
+    strlcpy(result.state, err == ESP_OK ? "success" : "fail", sizeof(result.state));
+    if (err != ESP_OK && !result.message[0])
+        snprintf(result.message, sizeof(result.message), "连接验证失败：%s，请稍后重试", esp_err_to_name(err));
+    if (app_config_set_wifi_setup_result(&result) != ESP_OK)
+        ESP_LOGE(TAG, "Cannot persist Wi-Fi setup result");
+    memset(request, 0, sizeof(*request));
+    free(request);
+    xSemaphoreGive(s_wifi_setup_slot);
+    vTaskDelete(NULL);
 }
 
 static esp_err_t wifi_post(httpd_req_t *req)
@@ -347,11 +447,45 @@ static esp_err_t wifi_post(httpd_req_t *req)
     if (!j) return send_error(req, "400 Bad Request", "无效 JSON");
     const char *ssid = json_string(j, "ssid");
     const char *password = json_string(j, "password");
-    esp_err_t err = wifi_manager_test_and_save(ssid, password, 20000);
+    if (!ssid || !ssid[0] || strlen(ssid) > APP_SSID_MAX_LEN || !password ||
+        strlen(password) > APP_WIFI_PASS_MAX_LEN) {
+        cJSON_Delete(j);
+        return send_error(req, "400 Bad Request", "SSID 需为 1–32 字节，密码不能超过 64 字节");
+    }
+    if (xSemaphoreTake(s_wifi_setup_slot, 0) != pdTRUE) {
+        cJSON_Delete(j);
+        return send_error(req, "409 Conflict", "正在扫描或验证 Wi-Fi，请稍后查看结果");
+    }
+    wifi_setup_request_t *request = calloc(1, sizeof(*request));
+    if (!request) {
+        cJSON_Delete(j);
+        xSemaphoreGive(s_wifi_setup_slot);
+        return send_error(req, "503 Service Unavailable", "内存不足，请稍后重试");
+    }
+    strlcpy(request->ssid, ssid, sizeof(request->ssid));
+    strlcpy(request->password, password, sizeof(request->password));
     cJSON_Delete(j);
-    if (err != ESP_OK) return send_error(req, "400 Bad Request", "无法连接该 Wi-Fi，请检查密码和信号");
-    cJSON *ok = cJSON_CreateObject(); cJSON_AddBoolToObject(ok, "ok", true);
-    return send_json(req, ok, NULL);
+    app_wifi_setup_result_t result = {0};
+    strlcpy(result.state, "pending", sizeof(result.state));
+    strlcpy(result.ssid, request->ssid, sizeof(result.ssid));
+    esp_err_t err = app_config_set_wifi_setup_result(&result);
+    TaskHandle_t task = NULL;
+    if (err == ESP_OK && xTaskCreate(wifi_setup_task, "wifi_setup", 6144, request, 4, &task) != pdPASS)
+        err = ESP_ERR_NO_MEM;
+    if (err != ESP_OK) {
+        memset(request, 0, sizeof(*request));
+        free(request);
+        strlcpy(result.state, "fail", sizeof(result.state));
+        strlcpy(result.message, "无法保存验证任务或创建后台任务，请稍后重试。", sizeof(result.message));
+        app_config_set_wifi_setup_result(&result);
+        xSemaphoreGive(s_wifi_setup_slot);
+        return send_error(req, "503 Service Unavailable", result.message);
+    }
+    cJSON *ok = cJSON_CreateObject();
+    cJSON_AddBoolToObject(ok, "accepted", true);
+    esp_err_t response = send_json(req, ok, "202 Accepted");
+    xTaskNotifyGive(task);
+    return response;
 }
 
 static esp_err_t mqtt_post(httpd_req_t *req)
@@ -410,8 +544,13 @@ static esp_err_t ota_post(httpd_req_t *req)
 
 esp_err_t web_config_start(void)
 {
+    s_scan_lock = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_scan_lock, ESP_ERR_NO_MEM, TAG, "Wi-Fi scan mutex");
+    s_wifi_setup_slot = xSemaphoreCreateBinary();
+    ESP_RETURN_ON_FALSE(s_wifi_setup_slot, ESP_ERR_NO_MEM, TAG, "Wi-Fi setup semaphore");
+    xSemaphoreGive(s_wifi_setup_slot);
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 10;
+    config.max_uri_handlers = 12;
     config.stack_size = 6144;
     ESP_RETURN_ON_ERROR(httpd_start(&s_server, &config), TAG, "http server");
     const httpd_uri_t handlers[] = {
@@ -419,6 +558,8 @@ esp_err_t web_config_start(void)
         {.uri = "/api/info", .method = HTTP_GET, .handler = info_get},
         {.uri = "/api/overview", .method = HTTP_GET, .handler = overview_get},
         {.uri = "/api/scan", .method = HTTP_GET, .handler = scan_get},
+        {.uri = "/api/scan", .method = HTTP_POST, .handler = scan_post},
+        {.uri = "/api/wifi", .method = HTTP_GET, .handler = wifi_get},
         {.uri = "/api/wifi", .method = HTTP_POST, .handler = wifi_post},
         {.uri = "/api/mqtt", .method = HTTP_POST, .handler = mqtt_post},
         {.uri = "/api/password", .method = HTTP_POST, .handler = password_post},

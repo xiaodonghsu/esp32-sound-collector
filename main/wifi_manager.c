@@ -33,6 +33,8 @@ static SemaphoreHandle_t s_lock;
 static SemaphoreHandle_t s_config_lock;
 static bool s_enabled;
 static bool s_attempting;
+static bool s_scanning;
+static uint8_t s_disconnect_reason;
 static char s_target_ssid[APP_SSID_MAX_LEN + 1];
 static uint32_t s_retry_ms = WIFI_RETRY_MIN_MS;
 static int64_t s_deadline_us;
@@ -68,6 +70,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_enabled) s_disconnect_reason = ((wifi_event_sta_disconnected_t *)data)->reason;
         bool was_active = s_connected || s_attempting;
         notify_state(false);
         if (was_active) schedule_retry();
@@ -95,7 +98,7 @@ static void reconnect_task(void *arg)
     (void)arg;
     while (true) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
-        if (s_enabled && !s_connected && esp_timer_get_time() >= s_deadline_us) {
+        if (s_enabled && !s_connected && !s_scanning && esp_timer_get_time() >= s_deadline_us) {
             if (s_attempting) {
                 /* Also recover an association that never obtains a DHCP lease. */
                 esp_wifi_disconnect();
@@ -155,10 +158,17 @@ esp_err_t wifi_manager_init(void)
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
 #if CONFIG_SOC_WIFI_SUPPORT_5G
     ESP_RETURN_ON_ERROR(esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO), TAG, "dual-band mode");
+    /* Select the initial SoftAP band before starting STA connection attempts.
+     * AUTO retains scanning/connecting on both bands; STA can later move AP. */
+    ESP_RETURN_ON_ERROR(esp_wifi_set_channel(36, WIFI_SECOND_CHAN_NONE), TAG, "initial 5 GHz AP channel");
 #endif
     ESP_RETURN_ON_FALSE(xTaskCreate(reconnect_task, "wifi_reconnect", 4096, NULL, 4, NULL) == pdPASS,
                         ESP_ERR_NO_MEM, TAG, "reconnect task");
-    ESP_LOGI(TAG, "configuration AP %s at 192.168.100.1", device_identity_ap_ssid());
+    #if CONFIG_SOC_WIFI_SUPPORT_5G
+    ESP_LOGI(TAG, "configuration AP %s at 192.168.100.1, initial 5 GHz channel 36", device_identity_ap_ssid());
+#else
+    ESP_LOGI(TAG, "configuration AP %s at 192.168.100.1, initial 2.4 GHz channel 1", device_identity_ap_ssid());
+#endif
     return ESP_OK;
 }
 
@@ -193,6 +203,7 @@ static esp_err_t apply_station(const char *ssid, const char *password)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     strlcpy(s_target_ssid, ssid, sizeof(s_target_ssid));
     s_retry_ms = WIFI_RETRY_MIN_MS;
+    s_disconnect_reason = 0;
     s_deadline_us = 0;
     s_enabled = true;
     xSemaphoreGive(s_lock);
@@ -211,6 +222,13 @@ esp_err_t wifi_manager_apply_saved(void)
 
 esp_err_t wifi_manager_test_and_save(const char *ssid, const char *password, uint32_t timeout_ms)
 {
+    return wifi_manager_test_and_save_detailed(ssid, password, timeout_ms, NULL, 0);
+}
+
+esp_err_t wifi_manager_test_and_save_detailed(const char *ssid, const char *password,
+                                             uint32_t timeout_ms, char *message, size_t size)
+{
+    if (message && size) message[0] = '\0';
     if (!ssid || !ssid[0] || !password || strlen(ssid) > APP_SSID_MAX_LEN ||
         strlen(password) > APP_WIFI_PASS_MAX_LEN) return ESP_ERR_INVALID_ARG;
     if (xSemaphoreTake(s_config_lock, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
@@ -223,6 +241,28 @@ esp_err_t wifi_manager_test_and_save(const char *ssid, const char *password, uin
         err = (bits & WIFI_CONNECTED_BIT) ? app_config_set_wifi(ssid, password) : ESP_ERR_TIMEOUT;
     }
     if (err != ESP_OK) {
+        if (message && size) {
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            uint8_t reason = s_disconnect_reason;
+            xSemaphoreGive(s_lock);
+            const char *detail = "连接或获取 IP 超时，请检查信号及路由器 DHCP";
+            switch (reason) {
+            case WIFI_REASON_NO_AP_FOUND: detail = "未找到目标网络，请检查 SSID、信号和频段"; break;
+            case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+            case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+                detail = "目标网络安全设置不兼容，请检查路由器认证方式"; break;
+            case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+                detail = "目标网络信号过弱，请靠近路由器后重试"; break;
+            case WIFI_REASON_AUTH_FAIL:
+            case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+            case WIFI_REASON_HANDSHAKE_TIMEOUT: detail = "认证或握手失败，请检查密码及路由器安全设置"; break;
+            case WIFI_REASON_ASSOC_FAIL: detail = "关联失败，请检查路由器接入限制和信号"; break;
+            default: break;
+            }
+            if (err == ESP_ERR_TIMEOUT)
+                snprintf(message, size, "%s（Wi-Fi 原因码 %u）", detail, (unsigned)reason);
+            else snprintf(message, size, "配置应用或保存失败：%s", esp_err_to_name(err));
+        }
         ESP_LOGW(TAG, "Wi-Fi validation/save failed; restoring saved configuration");
         esp_err_t restore_err = apply_station(old.wifi_ssid, old.wifi_password);
         if (restore_err != ESP_OK) ESP_LOGE(TAG, "restore failed: %s", esp_err_to_name(restore_err));
@@ -255,22 +295,37 @@ esp_err_t wifi_manager_scan(wifi_ap_record_t **records, uint16_t *count)
     if (!records || !count) return ESP_ERR_INVALID_ARG;
     *records = NULL;
     *count = 0;
-    wifi_scan_config_t scan = {.show_hidden = false, .scan_type = WIFI_SCAN_TYPE_ACTIVE};
-    ESP_RETURN_ON_ERROR(esp_wifi_scan_start(&scan, true), TAG, "scan");
-    uint16_t found = 0;
-    ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_num(&found), TAG, "scan count");
-    if (!found) return ESP_OK;
-    wifi_ap_record_t *list = calloc(found, sizeof(*list));
-    ESP_RETURN_ON_FALSE(list, ESP_ERR_NO_MEM, TAG, "scan records");
-    esp_err_t err = esp_wifi_scan_get_ap_records(&found, list);
-    if (err != ESP_OK) {
-        free(list);
-        return err;
+    if (xSemaphoreTake(s_config_lock, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_attempting) {
+        xSemaphoreGive(s_lock);
+        xSemaphoreGive(s_config_lock);
+        return ESP_ERR_INVALID_STATE;
     }
-    qsort(list, found, sizeof(*list), compare_scan_records);
-    *records = list;
-    *count = found;
-    return ESP_OK;
+    s_scanning = true;
+    xSemaphoreGive(s_lock);
+    wifi_scan_config_t scan = {.show_hidden = false, .scan_type = WIFI_SCAN_TYPE_ACTIVE};
+    esp_err_t err = esp_wifi_scan_start(&scan, true);
+    bool completed = err == ESP_OK;
+    uint16_t found = 0;
+    wifi_ap_record_t *list = NULL;
+    if (err == ESP_OK) err = esp_wifi_scan_get_ap_num(&found);
+    if (err == ESP_OK && found) {
+        list = calloc(found, sizeof(*list));
+        if (!list) err = ESP_ERR_NO_MEM;
+        else err = esp_wifi_scan_get_ap_records(&found, list);
+    }
+    if (completed) esp_wifi_clear_ap_list();
+    if (err == ESP_OK) {
+        if (found) qsort(list, found, sizeof(*list), compare_scan_records);
+        *records = list;
+        *count = found;
+    } else free(list);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_scanning = false;
+    xSemaphoreGive(s_lock);
+    xSemaphoreGive(s_config_lock);
+    return err;
 }
 
 bool wifi_manager_is_connected(void)

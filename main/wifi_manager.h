@@ -19,3 +19,7 @@ unsigned wifi_manager_frequency_mhz(uint8_t channel);
 void wifi_manager_ip(char *out, size_t size);
 void wifi_manager_ssid(char *out, size_t size);
 void wifi_manager_set_state_callback(wifi_manager_state_cb_t callback, void *ctx);
+
+/* Optional diagnostic is captured before rolling back the attempted network. */
+esp_err_t wifi_manager_test_and_save_detailed(const char *ssid, const char *password,
+                                             uint32_t timeout_ms, char *message, size_t size);

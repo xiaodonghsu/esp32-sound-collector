@@ -32,3 +32,12 @@ esp_err_t app_config_set_wifi(const char *ssid, const char *password);
 esp_err_t app_config_set_mqtt(const char *host, uint16_t port,
                               const char *username, const char *password);
 esp_err_t app_config_set_web_password(const char *password);
+
+/* Latest web provisioning result; credentials are never stored in this record. */
+typedef struct {
+    char state[16];
+    char ssid[APP_SSID_MAX_LEN + 1];
+    char message[256];
+} app_wifi_setup_result_t;
+void app_config_get_wifi_setup_result(app_wifi_setup_result_t *out);
+esp_err_t app_config_set_wifi_setup_result(const app_wifi_setup_result_t *result);
