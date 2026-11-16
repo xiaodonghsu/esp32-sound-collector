@@ -9,6 +9,7 @@
 typedef void (*wifi_manager_state_cb_t)(bool connected, void *ctx);
 
 esp_err_t wifi_manager_init(void);
+void wifi_manager_set_ap_enabled(bool enabled);
 esp_err_t wifi_manager_apply_saved(void);
 esp_err_t wifi_manager_test_and_save(const char *ssid, const char *password, uint32_t timeout_ms);
 esp_err_t wifi_manager_scan(wifi_ap_record_t **records, uint16_t *count);

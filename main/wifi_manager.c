@@ -34,6 +34,7 @@ static SemaphoreHandle_t s_config_lock;
 static bool s_enabled;
 static bool s_attempting;
 static bool s_scanning;
+static bool s_ap_enabled;
 static uint8_t s_disconnect_reason;
 static char s_target_ssid[APP_SSID_MAX_LEN + 1];
 static uint32_t s_retry_ms = WIFI_RETRY_MIN_MS;
@@ -156,6 +157,7 @@ esp_err_t wifi_manager_init(void)
     ap.ap.pmf_cfg.required = false;
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap), TAG, "AP config");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
+    s_ap_enabled = true;
 #if CONFIG_SOC_WIFI_SUPPORT_5G
     ESP_RETURN_ON_ERROR(esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO), TAG, "dual-band mode");
     /* Select the initial SoftAP band before starting STA connection attempts.
@@ -170,6 +172,23 @@ esp_err_t wifi_manager_init(void)
     ESP_LOGI(TAG, "configuration AP %s at 192.168.100.1, initial 2.4 GHz channel 1", device_identity_ap_ssid());
 #endif
     return ESP_OK;
+}
+
+void wifi_manager_set_ap_enabled(bool enabled)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    /* Keep the configuration path available if STA drops before the switch. */
+    enabled = enabled || !s_connected;
+    if (enabled != s_ap_enabled && !s_scanning) {
+        esp_err_t err = esp_wifi_set_mode(enabled ? WIFI_MODE_APSTA : WIFI_MODE_STA);
+        if (err == ESP_OK) {
+            s_ap_enabled = enabled;
+            ESP_LOGI(TAG, "configuration AP %s", enabled ? "enabled" : "disabled");
+        } else {
+            ESP_LOGW(TAG, "configuration AP mode switch failed: %s", esp_err_to_name(err));
+        }
+    }
+    xSemaphoreGive(s_lock);
 }
 
 static esp_err_t apply_station(const char *ssid, const char *password)

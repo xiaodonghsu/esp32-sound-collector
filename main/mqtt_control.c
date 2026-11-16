@@ -357,6 +357,7 @@ static void connection_task(void *arg)
     int64_t retry_at_us = 0;
     bool was_online = false;
     while (true) {
+        wifi_manager_set_ap_enabled(!mqtt_control_is_connected());
         xSemaphoreTake(s_lock, portMAX_DELAY);
         bool online = wifi_manager_is_connected();
         int64_t now = esp_timer_get_time();
@@ -402,6 +403,12 @@ esp_err_t mqtt_control_init(void)
         return ESP_ERR_NO_MEM;
     }
     return err;
+}
+
+bool mqtt_control_is_connected(void)
+{
+    return s_connection_events && wifi_manager_is_connected() &&
+           (xEventGroupGetBits(s_connection_events) & MQTT_CONNECTED_BIT) != 0;
 }
 
 esp_err_t mqtt_control_reload(void)
